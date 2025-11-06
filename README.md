@@ -1,158 +1,99 @@
 ![1513a619-6193-4a40-ae8d-f9019696df76 (1)](https://github.com/user-attachments/assets/182c042e-6379-49f1-b037-b3f10e545cca)
 
-# ForensIQ: Elasticsearch and CSV DFIR Log Analysis with Ollama LLM AI
+# ForensIQ
 
-ForensIQ is an advanced log analysis tool intended for DFIR analysts that combines Elasticsearch with Ollama's AI capabilities to provide progressive summarization and entity tracking for forensic investigations.
+**ForensIQ** is a fast, accurate, and modern digital forensics automation tool designed for incident responders, DFIR analysts, and cybersecurity investigators. This redesigned version focuses on speed, accuracy, and improved usability while maintaining powerful forensic capabilities.
 
-## Key Features
+---
 
-- **AI-Powered Analysis**: Utilizes Ollama's LLMs (including Mistral, Llama3, and Mixtral) for intelligent log analysis
-- **Progressive Summarization**: Builds context across large log sets with chunked processing
-- **Entity Tracking**: Identifies and tracks entities (IPs, users, URLs) across logs
-- **Threat Detection**: Maps suspicious activity to MITRE ATT&CK techniques
-- **Dynamic Chunking**: Automatically adjusts log chunk sizes based on model context limits
-- **Interactive Investigation**: Supports follow-up questions with full context awareness
+## 🚀 Features
 
-## Supported Models
+- **Faster Analysis:** Optimized for speed to process large datasets efficiently.
+- **Accurate Investigations:** Enhanced detection and parsing for forensic artifacts.
+- **Multi-Format Support:** Handles multiple file types and system logs seamlessly.
+- **Command-Line Friendly:** Fully scriptable for automation and integration into workflows.
+- **Detailed Reporting:** Generates structured outputs for easy review and incident documentation.
+- **Intuitive Logging:** Logs actions, errors, and results for audit and troubleshooting.
+- **Extensible:** Modular design allows adding new parsing modules and data sources.
 
-ForensIQ supports multiple Ollama models with different capabilities:
+---
 
-| Model        | RAM Required | Context Length | Best For                  |
-|--------------|-------------|----------------|---------------------------|
-| gemma:2b     | 2GB         | 8k tokens      | Quick analysis            |
-| phi          | 2GB         | 2k tokens      | Compact analysis          |
-| phi3:mini    | 2-3GB       | 128k tokens    | Long-context lightweight  |
-| tinyllama    | 1GB         | 2k tokens      | Basic tasks               |
-| llama2:7b    | 8GB         | 4-8k tokens    | Balanced performance      |
-| mistral      | 4GB         | 32k tokens     | High quality output       |
-| llama3:8b    | 12GB        | 8k tokens      | Improved reasoning        |
-| llama3:70b   | 39GB        | 8k tokens      | High capability analysis  |
-| mixtral      | 29GB        | 32k tokens     | Best overall quality      |
+## 🛠 Installation
 
-## Installation
+1. Clone the repository:
 
-1. Ensure you have Python 3.8+ installed
-2. Install required packages:
-   ```bash
-   pip install requests yaspin psutil
-3. Install required packages:
-
-## Configuration
-On first run, ForensIQ will create a configuration file (ollama-config.txt) with:
-
-Elasticsearch URL and credentials
-
-Ollama URL and selected model
-
-Analysis parameters
-
-The tool will automatically validate your system's RAM and suggest appropriate models.
-
-##  Usage
-   ```bash
-   python forensiq.py
-```
-1. Select an Elasticsearch index to analyze
-2. Choose between default or custom analysis prompts
-3. Review the progressive analysis as it processes logs
-4. Ask follow-up questions with full context awareness
-5. Export complete reports as HTML
-
-## Analysis Capabilities
-ForensIQ performs comprehensive log analysis including:
-
-- Suspicious event categorization
-- Significance explanation
-- Attacker objective identification
-- Investigation step recommendations
-- Defensive strategies
-- Timeline reconstruction
-- IOC extraction
-
-## Output Format
-
-![image](https://github.com/user-attachments/assets/801060cd-4e09-431c-b6e9-e4a496751e74)
-![image](https://github.com/user-attachments/assets/83c52992-1c7b-4ae6-be76-0a5da608d015)
-   
-### Final Analysis Report
-   ```
-   1. Executive Summary:
-An unauthorized attacker has gained access to the network and compromised several systems, including IEWIN7 and LAPTOP-JU4M3I0E. The attacker established persistence by creating a local account (support) with administrative privileges on LAPTOP-JU4M3I0E and potentially exfiltrating sensitive data using the WMIGhost script.
-
-2. Detailed Timeline of Events:
-- 2023-01-01T05:54.9Z: Creation of local account support on LAPTOP-JU4M3I0E with administrative privileges
-- 2023-01-01T05:55.0Z: Addition of new account to admin group on LAPTOP-JU4M3I0E
-- 2023-01-01T05:55.1Z: Modification of WMI filters on IEWIN7
-
-3. Identified Attack Patterns Mapped to MITRE ATT&CK:
-- T1078 - Lateral Movement: Creation and modification of local accounts, addition to admin group
-- T1575 - Tool Use (WMIGhost): Potential data exfiltration
-
-4. Recommended Investigation Steps:
-- Analyze the WMIGhost script for any indicators of compromise (IOCs) such as command-and-control (C2) servers or malicious payloads.
-- Investigate the account creation event to determine if it was a result of an attack or a legitimate administrative action.
-- Examine the local administrator group on LAPTOP-JU4M3I0E for any unusual additions or modifications.
-- Monitor network traffic for outbound connections to suspicious IP addresses or domains associated with the WMIGhost script.
-
-5. Mitigation Strategies:
-- Implement strong password policies and enforce multi-factor authentication for administrative accounts.
-- Regularly review and monitor local administrator groups for any unauthorized additions or modifications.
-- Restrict the use of scripts like WMIGhost where possible, and implement strict access controls to limit their execution.
-- Implement an endpoint detection and response (EDR) solution to detect and respond to such activities in real-time.
-
-6. List of all Critical IOCs:
-- IPs: None identified
-- Users: PC04\\IEUser, NT AUTHORITY\\SYSTEM
-- URLs: http://kumardeep.sosblogs.com/The-first-blog-b1/RSS-b1-rss2-posts.htm, http://blogs.rediff.com/anilchopra/feed/, http://www.blogster.com/kapoorsunil09/profile/rss
-
-7. Any Remaining Questions or Areas Needing Clarification:
-- The purpose of the account creation event on LAPTOP-JU4M3I0E and whether it was a result of an attack or a legitimate administrative action.
-- The origin and intent behind the WMIGhost script execution on IEWIN7.
-```
-### Follow-up Response #1
-```
- Based on the provided logs and analysis summary, here are some key points to address your question:
-
-1. Previously identified entities or patterns: The IP address `10.0.2.16` and user account `S-1-5-20` have been associated with a lateral movement attack using Remote Desktop Protocol (RDP).
-
-2. Timeline events related to the question: The suspicious activity started at approximately 23:23, as indicated in the event logs. Multiple connections from IP address `10.0.2.16` to system `MSEDGEWIN10` were observed over a short period of time.
-
-3. Attack techniques that may be relevant: The attacker appears to be using RDP for lateral movement, attempting to establish persistent access or perform reconnaissance on the targeted system.
-
-4. Any new insights from connecting the question to existing data: If further investigation reveals that the user account `S-1-5-20` has elevated privileges, it could indicate that the attacker gained unauthorized access to sensitive systems or data. Additionally, if any unusual activity is found on other systems accessed from IP address `10.0.2.16`, it may suggest a broader campaign by the attacker.
-
-In light of these findings, it would be advisable to:
-- Investigate the user account `S-1-5-20` and its privileges.
-- Examine other systems that have been accessed from IP address `10.0.2.16`.
-- Check for any unusual activity on the system `MSEDGEWIN10`, such as file modifications, process executions, or network connections.
-- Investigate the origin of IP address `10.0.2.16` and its associated subnet to determine if it is part of a larger campaign.
-
-Defensive recommendations:
-- Implement strong password policies and enforce multi-factor authentication for RDP sessions.
-- Regularly update and patch all systems, especially those exposed to the internet.
-- Disable RDP if it is not necessary for business operations.
-- Use a VPN or bastion host for remote access to internal networks.
-- Monitor network traffic for unusual patterns of RDP usage.
-- Implement an intrusion detection system (IDS) or intrusion prevention system (IPS) to detect and prevent such attacks.
+```bash
+git clone https://github.com/dfirvault/ForensIQ.git
+cd ForensIQ
 ```
 
-## Requirements
-Elasticsearch cluster (7.x+)
+2. Install dependencies:
 
-Ollama server with at least one LLM model
+```bash
+pip install --upgrade langchain langchain-community langchain-ollama langchain-huggingface sentence-transformers chromadb pandas streamlit python-evtx
+```
+or launch the batch script:
+https://github.com/dfirvault/ForensIQ/blob/main/ForensIQLauncher.bat
 
-Minimum 2GB RAM (4GB+ recommended)
+3. Run the tool:
 
-## 👤 Author
+```bash
+python streamlit run Forensiq.py
+```
 
-**Jacob Wilson**  
-📧 dfirvault@gmail.com
-[https://www.linkedin.com/in/jacob--wilson/](https://www.linkedin.com/in/jacob--wilson/)
+or launch the batch script:
+https://github.com/dfirvault/ForensIQ/blob/main/ForensIQLauncher.bat
 
-**More information:**
-[https://dfirvault.com](https://dfirvault.com)
+---
 
-Python 3.8+
+## ⚡ Usage
 
-## License
-ForensIQ is released under the MIT License.
+supports single or multiple files, or you can point it to a local folder where it will automatically identify and queue all available logs.
+
+<img width="1823" height="360" alt="image" src="https://github.com/user-attachments/assets/8bd910ed-3abd-4a7c-8448-395c91bb77de" />
+
+
+---
+
+## 📝 Output
+
+- **JSON Reports:** Structured forensic data.
+- **CSV Summaries:** Quick overview of findings.
+- **Logs:** Detailed logging for reproducibility and audits.
+
+---
+
+## 🔧 Requirements
+
+- Python 3.11+
+- `pip` package manager
+- Supported only on Windows (Sorry *nix users)
+
+---
+
+## 📂 Supported Platforms
+
+- Windows
+
+---
+
+## 🌐 Contributing
+
+Contributions are welcome! Please follow these steps:
+
+1. Fork the repository.
+2. Create a new branch (`git checkout -b feature-name`).
+3. Make your changes.
+4. Submit a pull request.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## 📬 Contact
+
+For support or inquiries, please open an issue on GitHub or contact the maintainer at [dfirvault@gmail.com].
