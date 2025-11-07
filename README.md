@@ -2,7 +2,7 @@
 
 # ForensIQ
 
-**ForensIQ** is a fast, accurate, and modern digital forensics automation tool designed for incident responders, DFIR analysts, and cybersecurity investigators. This redesigned version focuses on speed, accuracy, and improved usability while maintaining powerful forensic capabilities.
+**ForensIQ** is a fast, accurate, and modern digital forensics automation tool designed for incident responders, DFIR analysts, and cybersecurity investigators. This redesigned version focuses on speed, accuracy, and improved usability while maintaining powerful forensic capabilities. This tool requires an Ollama service running locally or on a computer that your Windows computer can connect to. Installing Ollama is very simple and easy. For this tool, just input the IP of the device that runs your Ollama LLM (local or remote).
 
 ---
 
