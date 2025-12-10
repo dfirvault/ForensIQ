@@ -12,7 +12,7 @@ if exist "config.txt" (
 ) else (
     echo config.txt NOT found.
     echo Installing required packages first...
-    pip install --upgrade langchain langchain-community langchain-ollama langchain-huggingface sentence-transformers chromadb pandas streamlit python-evtx
+    pip install --upgrade langchain langchain-community langchain-ollama langchain-huggingface sentence-transformers chromadb pandas streamlit psutil pynvmlpython-evtx
 
     echo Starting Streamlit service...
     start "" streamlit run Forensiq.py
