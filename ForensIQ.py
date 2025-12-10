@@ -8,12 +8,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableSequence, RunnablePassthrough, RunnableLambda
 import datetime
+import pynvml
 import chromadb
 import requests
 import subprocess
 import json
 import time
 from pathlib import Path
+import gc
 
 # Import for folder picker
 import shutil
@@ -52,7 +54,7 @@ CONFIG_FILE = 'config.txt'
 # Enhanced supported extensions with common log file patterns
 SUPPORTED_EXTENSIONS = {
     '.csv': 'CSV Log File',
-    '.evtx': 'Windows Event Log', 
+    '.evtx': 'Windows Event Log',
     '.log': 'Text Log File',
     '.txt': 'Text File',
     '.json': 'JSON Log File',
@@ -121,7 +123,7 @@ MODEL_CATEGORIES = {
         "description": "🚀 Very Fast (Basic Hardware)",
         "models": [
             "tinyllama:1.1b", "tinyllama:1.1b-chat", "tinyllama:1.1b-chat-q4_0",
-            "qwen2.5:0.5b", "qwen2.5:0.5b-instruct", 
+            "qwen2.5:0.5b", "qwen2.5:0.5b-instruct",
             "llama3.2:1b", "llama3.2:1b-instruct",
             "phi2:2.7b", "phi2:2.7b-instruct",
             "stablelm2:1.6b", "stablelm2:1.6b-instruct"
@@ -145,7 +147,7 @@ MODEL_CATEGORIES = {
         "models": [
             "phi3:mini", "phi3:mini-instruct",
             "qwen2.5:7b", "qwen2.5:7b-instruct",
-            "llama3.1:8b", "llama3.1:8b-instruct", 
+            "llama3.1:8b", "llama3.1:8b-instruct",
             "llama3:8b", "llama3:8b-instruct",
             "gemma2:9b", "gemma2:9b-instruct",
             "codegemma:7b", "codegemma:7b-instruct",
@@ -351,7 +353,7 @@ def load_config():
                             config[key] = json.loads(value)
                         except json.JSONDecodeError:
                             # Fallback for old/corrupted prompt
-                            config[key] = value 
+                            config[key] = value
                     else:
                         config[key] = value
         
@@ -362,8 +364,6 @@ def load_config():
             config['dfir_prompt'] = DEFAULT_DFIR_PROMPT
 
         # --- FIX for old, un-escaped prompts ---
-        # If the loaded prompt is just the *first line*, it's an old file.
-        # Reset it to default. The user can re-save from the UI.
         if 'You are a senior DFIR' in config['dfir_prompt'] and len(config['dfir_prompt']) < 100:
             st.warning("Old config.txt format detected. Resetting prompt to default.")
             config['dfir_prompt'] = DEFAULT_DFIR_PROMPT
@@ -377,7 +377,6 @@ def load_config():
 # --- UPDATED: save_config() with JSON fix ---
 def save_config(config):
     # We must use json.dumps to escape newlines and special chars
-    # so the prompt is saved as a single, valid JSON string line.
     prompt = config.pop('dfir_prompt', DEFAULT_DFIR_PROMPT)
     prompt_to_save = json.dumps(prompt)
     
@@ -405,23 +404,352 @@ def select_folder():
         st.error(f"Error opening folder dialog: {e}")
         return None
 
-# --- NEW: File Picker Helper Function ---
-def select_files():
-    """Opens a Tcl/Tk file dialog to select multiple files."""
+# --- NEW: Streaming CSV processing function ---
+def process_csv_in_streaming_chunks(file_path, chunk_size=50000):
+    """Process CSV in streaming chunks with immediate filtering"""
     try:
-        root = tk.Tk()
-        root.withdraw()  # Hide the main tkinter window
-        root.attributes('-topmost', True)  # Bring the dialog to the front
-        file_paths = filedialog.askopenfilenames(
-            master=root,
-            title="Select log files",
-            filetypes=[("Log files", "*.csv *.evtx *.log *.txt *.json *.xml *.syslog"), ("All files", "*.*")]
+        st.write("📊 Processing CSV in streaming chunks...")
+        
+        # Use pandas read_csv with chunksize for streaming
+        security_keywords = ['login', 'error', 'access', 'failed', 'security', 
+                           'audit', 'authentication', 'denied', 'warning', 'alert']
+        keyword_pattern = '|'.join(security_keywords)
+        
+        # Read CSV in chunks
+        chunk_iterator = pd.read_csv(
+            file_path,
+            delimiter=',',
+            quoting=3,
+            encoding='utf-8',
+            on_bad_lines='skip',
+            engine='python',
+            chunksize=chunk_size,
+            low_memory=True
         )
-        root.destroy()
-        return list(file_paths)
+        
+        total_filtered_rows = 0
+        chunk_count = 0
+        chunks = []
+        
+        for chunk in chunk_iterator:
+            chunk_count += 1
+            initial_rows = len(chunk)
+            
+            # Filter chunk for security-relevant data using vectorized operations
+            if not chunk.empty:
+                # Combine all columns into a single string for searching
+                combined_text = chunk.astype(str).agg(' '.join, axis=1)
+                
+                # Use vectorized string contains for speed
+                mask = combined_text.str.contains(keyword_pattern, case=False, na=False)
+                filtered_chunk = chunk[mask]
+                
+                filtered_rows = len(filtered_chunk)
+                total_filtered_rows += filtered_rows
+                
+                if filtered_rows > 0:
+                    chunks.append(filtered_chunk)
+                
+                # Immediate progress update
+                st.write(f"🔄 Chunk {chunk_count}: {initial_rows:,} → {filtered_rows:,} relevant rows (Total: {total_filtered_rows:,})")
+                
+                # Early yield if we have enough data
+                if total_filtered_rows >= 10000 and chunks:
+                    yield pd.concat(chunks, ignore_index=True)
+                    chunks = []  # Reset for next batch
+        
+        # Yield any remaining chunks
+        if chunks:
+            yield pd.concat(chunks, ignore_index=True)
+        
+        st.write(f"✅ Processed all chunks: {total_filtered_rows:,} total relevant rows")
+        
     except Exception as e:
-        st.error(f"Error opening file dialog: {e}")
-        return None
+        st.error(f"❌ Error streaming CSV: {str(e)}")
+        yield pd.DataFrame()  # Return empty DataFrame on error
+
+# --- NEW: Streaming chunk generator ---
+def chunk_logs_streaming(df, chunk_size=3000, chunk_overlap=300):
+    """Stream chunks from DataFrame without loading everything into memory at once"""
+    try:
+        st.write("✂️ Streaming chunks from log data...")
+        
+        # Process in smaller batches
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
+        
+        # Process DataFrame in chunks
+        rows_per_batch = 5000  # Process 5,000 rows at a time
+        total_rows = len(df)
+        all_chunks = []
+        
+        for i in range(0, total_rows, rows_per_batch):
+            batch_end = min(i + rows_per_batch, total_rows)
+            batch_df = df.iloc[i:batch_end]
+            
+            # Convert batch to string
+            if 'file' in batch_df.columns:
+                batch_text = batch_df.drop(columns=['file'], errors='ignore').to_string(index=False)
+            else:
+                batch_text = batch_df.to_string(index=False)
+            
+            # Split this batch
+            batch_chunks = text_splitter.split_text(batch_text)
+            all_chunks.extend(batch_chunks)
+            
+            # Yield chunks as they're available
+            for chunk in batch_chunks:
+                yield chunk
+            
+            # Update progress
+            progress = min(100, int((batch_end / total_rows) * 100))
+            if progress % 20 == 0:  # Update every 20% to avoid too many messages
+                st.write(f"📊 Chunking progress: {progress}% ({batch_end}/{total_rows} rows)")
+        
+        st.write(f"✅ Created {len(all_chunks)} total chunks for analysis")
+        
+    except Exception as e:
+        st.error(f"❌ Error streaming chunks: {str(e)}")
+        yield from []
+
+# --- NEW: Function to determine optimal batch size ---
+def determine_optimal_batch_size(gpu_info, document_size_estimate=1000):
+    """Determine optimal batch size based on GPU memory and document size"""
+    try:
+        import torch
+        
+        if gpu_info and gpu_info.get("available", False):
+            vram_gb = gpu_info.get("vram_gb", 0)
+            
+            # Estimate memory per document (rough approximation)
+            # Each embedding dimension typically 768-1024 floats (4 bytes each)
+            embedding_dim = 1024  # Conservative estimate
+            bytes_per_embedding = embedding_dim * 4  # 4 bytes per float32
+            
+            # Documents have text too, estimate 2x for overhead
+            estimated_bytes_per_doc = bytes_per_embedding * 2
+            
+            # Conservative memory calculation: leave 2GB for system/other
+            available_vram_bytes = (vram_gb - 2) * 1024**3 if vram_gb > 4 else vram_gb * 1024**3 * 0.5
+            
+            # Calculate max batch size
+            max_batch_size = int(available_vram_bytes / estimated_bytes_per_doc)
+            
+            # Apply reasonable limits
+            if vram_gb >= 16:
+                optimal_batch = min(max_batch_size, 500)  # Up to 500 for large GPUs
+            elif vram_gb >= 8:
+                optimal_batch = min(max_batch_size, 250)  # Up to 250 for mid-range GPUs
+            elif vram_gb >= 4:
+                optimal_batch = min(max_batch_size, 100)  # Up to 100 for smaller GPUs
+            else:
+                optimal_batch = 50  # Conservative for low VRAM
+            
+            return optimal_batch
+        
+    except Exception as e:
+        st.warning(f"⚠️ Could not determine optimal batch size: {e}")
+    
+    # Default batch sizes based on common scenarios
+    return 200  # Increased default from 10
+
+# --- NEW: GPU monitoring function ---
+def monitor_gpu_utilization():
+    """Monitor GPU utilization and memory usage"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # Get current GPU stats
+            device = torch.cuda.current_device()
+            memory_allocated = torch.cuda.memory_allocated(device) / 1024**3
+            memory_reserved = torch.cuda.memory_reserved(device) / 1024**3
+            utilization = torch.cuda.utilization(device) if hasattr(torch.cuda, 'utilization') else 0
+            
+            # Get more detailed stats if pynvml is available
+            try:
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+                utilization = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+                temperature = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                pynvml.nvmlShutdown()
+                
+                return {
+                    'memory_allocated_gb': memory_allocated,
+                    'memory_reserved_gb': memory_reserved,
+                    'utilization_percent': utilization,
+                    'temperature_c': temperature,
+                    'device_name': torch.cuda.get_device_name(device)
+                }
+            except:
+                return {
+                    'memory_allocated_gb': memory_allocated,
+                    'memory_reserved_gb': memory_reserved,
+                    'utilization_percent': utilization,
+                    'device_name': torch.cuda.get_device_name(device)
+                }
+    except:
+        pass
+    
+    return None
+
+# --- NEW: Incremental vector store builder with GPU optimization ---
+def build_vector_store_incrementally(chunks_generator, config, ollama_url, status_callback=None, batch_size=100):
+    """Build vector store incrementally as chunks become available with optimized batch sizes"""
+    persist_directory = tempfile.mkdtemp()
+    st.write(f"🔧 Using temporary vector store directory: {Path(persist_directory).name}")
+    
+    try:
+        st.write(f"🔧 Building vector store incrementally (batch size: {batch_size})...")
+        
+        # Initialize embeddings
+        embeddings = OllamaEmbeddings(
+            model=config['embedding_model'],
+            base_url=ollama_url
+        )
+        
+        # Test embedding with a small sample
+        _ = embeddings.embed_query("Test embedding")
+        
+        # Create Chroma client
+        chroma_client = chromadb.PersistentClient(path=persist_directory)
+        
+        # Initialize collection with optimized settings for better performance
+        collection_name = "log_analysis_streaming"
+        collection = chroma_client.get_or_create_collection(
+            name=collection_name,
+            metadata={
+                "hnsw:space": "cosine",
+                "hnsw:construction_ef": 128,  # Lower for faster building
+                "hnsw:M": 16,  # Lower for faster building
+            }
+        )
+        
+        chunk_counter = 0
+        total_docs = 0
+        all_docs = []
+        all_texts = []
+        
+        # Monitor timing for optimization
+        import time
+        start_time = time.time()
+        batch_times = []
+        
+        # Process chunks as they come
+        for chunk_text in chunks_generator:
+            if not chunk_text:
+                continue
+                
+            # Add document to list for batch processing
+            doc = Document(page_content=chunk_text)
+            all_docs.append(doc)
+            all_texts.append(chunk_text)
+            
+            # Process in larger batches to improve GPU utilization
+            if len(all_docs) >= batch_size:
+                batch_start = time.time()
+                
+                # Get embeddings for the entire batch at once
+                batch_embeddings = embeddings.embed_documents(all_texts)
+                
+                # Add to collection in a single operation
+                batch_ids = [f"doc_{chunk_counter}_{i}" for i in range(len(all_docs))]
+                collection.add(
+                    documents=all_texts,
+                    embeddings=batch_embeddings,
+                    ids=batch_ids
+                )
+                
+                total_docs += len(all_docs)
+                chunk_counter += 1
+                
+                # Calculate batch processing time
+                batch_time = time.time() - batch_start
+                batch_times.append(batch_time)
+                avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else batch_time
+                
+                docs_per_second = len(all_docs) / batch_time if batch_time > 0 else 0
+                
+                st.write(f"📚 Batch {chunk_counter}: Added {len(all_docs)} documents "
+                        f"({docs_per_second:.1f} docs/sec, avg: {avg_batch_time:.2f}s per batch) "
+                        f"[Total: {total_docs}]")
+                
+                # Call status callback if provided
+                if status_callback:
+                    status_callback({
+                        'progress': min(100, int((chunk_counter * batch_size) / max(1, chunk_counter * batch_size) * 100)),
+                        'total_docs': total_docs,
+                        'batch_size': len(all_docs),
+                        'docs_per_second': docs_per_second,
+                        'status': 'building'
+                    })
+                
+                # Clear batch
+                all_docs = []
+                all_texts = []
+        
+        # Process any remaining documents
+        if all_docs:
+            batch_start = time.time()
+            batch_embeddings = embeddings.embed_documents(all_texts)
+            batch_ids = [f"doc_{chunk_counter}_{i}" for i in range(len(all_docs))]
+            
+            collection.add(
+                documents=all_texts,
+                embeddings=batch_embeddings,
+                ids=batch_ids
+            )
+            
+            total_docs += len(all_docs)
+            chunk_counter += 1
+            
+            batch_time = time.time() - batch_start
+            docs_per_second = len(all_docs) / batch_time if batch_time > 0 else 0
+            
+            st.write(f"📚 Final batch: Added {len(all_docs)} documents "
+                    f"({docs_per_second:.1f} docs/sec) [Total: {total_docs}]")
+        
+        total_time = time.time() - start_time
+        overall_docs_per_second = total_docs / total_time if total_time > 0 else 0
+        
+        st.write(f"✅ Vector store complete: {total_docs} documents in {total_time:.1f}s "
+                f"({overall_docs_per_second:.1f} docs/sec overall)")
+        
+        # Create the LangChain vectorstore wrapper
+        vectorstore = Chroma(
+            client=chroma_client,
+            collection_name=collection_name,
+            embedding_function=embeddings
+        )
+        
+        if status_callback:
+            status_callback({
+                'progress': 100,
+                'total_docs': total_docs,
+                'vectorstore': vectorstore,
+                'persist_dir': persist_directory,
+                'overall_docs_per_second': overall_docs_per_second,
+                'status': 'complete'
+            })
+        
+        return {
+            'progress': 100,
+            'total_docs': total_docs,
+            'vectorstore': vectorstore,
+            'persist_dir': persist_directory,
+            'overall_docs_per_second': overall_docs_per_second,
+            'status': 'complete'
+        }
+        
+    except Exception as e:
+        st.error(f"❌ Error building incremental vector store: {str(e)}")
+        if os.path.exists(persist_directory):
+            try:
+                shutil.rmtree(persist_directory)
+            except:
+                pass
+        return {'status': 'error', 'error': str(e)}
 
 def get_available_models(ollama_url):
     """Get available models from Ollama API"""
@@ -495,7 +823,7 @@ def create_model_display_name(model_name):
     emoji = {
         "gpu_optimized": "⚡",
         "very_fast": "🚀",
-        "fast": "⚡", 
+        "fast": "⚡",
         "balanced": "🎯",
         "quality": "🏆"
     }.get(category, "🔹")
@@ -527,7 +855,7 @@ def detect_gpu():
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            recommended_model = get_gpu_recommendation()[0]
+            recommended_model = "llama3.2:3b-instruct-q4_0"  # Default GPU recommendation
             return {
                 "available": True,
                 "name": gpu_name,
@@ -635,7 +963,7 @@ def discover_log_files(folder_path):
                     processed_files += 1
                     
                 except Exception as e:
-                    st.warning(f"Could not process file {file_path}: {e}")
+                    st.warning(f"Could not process file {file_path.name}: {e}")
                     skipped_files += 1
                     continue
         
@@ -654,17 +982,26 @@ def discover_log_files(folder_path):
 def process_text_file(file_path):
     """Process generic text files for log content"""
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-        
+        # Read file in chunks for large files
         log_lines = []
-        for line in lines:
-            if any(pattern in line.lower() for pattern in ['error', 'warn', 'info', 'debug', 'exception', 'failed', 'login', 'access']):
-                log_lines.append(line.strip())
+        batch_size = 10000
+        
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            batch = []
+            for i, line in enumerate(f):
+                if any(pattern in line.lower() for pattern in ['error', 'warn', 'info', 'debug', 'exception', 'failed', 'login', 'access']):
+                    batch.append(line.strip())
+                
+                if len(batch) >= batch_size:
+                    log_lines.extend(batch)
+                    batch = []
+            
+            if batch:
+                log_lines.extend(batch)
         
         if log_lines:
             df = pd.DataFrame({
-                'timestamp': [datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")] * len(log_lines),
+                'timestamp': [datetime.datetime.now().strftime("%Y-%m-d %H:%M:%S")] * len(log_lines),
                 'message': log_lines,
                 'file': [os.path.basename(file_path)] * len(log_lines)
             })
@@ -673,41 +1010,63 @@ def process_text_file(file_path):
             return None
             
     except Exception as e:
-        st.warning(f"Could not process text file {file_path}: {e}")
+        st.warning(f"Could not process text file {Path(file_path).name}: {e}")
         return None
 
 def process_json_file(file_path):
     """Process JSON log files"""
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            data = json.load(f)
+        # Try to read JSON in chunks if it's a JSONL file
+        lines = []
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            data = json.loads(line)
+                            lines.append(data)
+                        except json.JSONDecodeError:
+                            # Skip invalid JSON lines
+                            continue
+        except:
+            # Fallback to reading entire file
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    lines = data
+                else:
+                    lines = [data]
         
-        if isinstance(data, list):
-            df = pd.DataFrame(data)
-        else:
-            df = pd.DataFrame([data])
-        
-        if not df.empty:
-            df = df[df.apply(lambda row: row.astype(str).str.contains('login|error|access|failed|security|audit|authentication|denied|warning|alert', case=False, na=False).any(), axis=1)]
+        if lines:
+            df = pd.DataFrame(lines)
             if not df.empty:
-                df['file'] = os.path.basename(file_path)
-                return df
+                # Filter for security-relevant data
+                df = df[df.apply(lambda row: row.astype(str).str.contains(
+                    'login|error|access|failed|security|audit|authentication|denied|warning|alert', 
+                    case=False, na=False).any(), axis=1)]
+                if not df.empty:
+                    df['file'] = os.path.basename(file_path)
+                    return df
         
         return None
         
     except Exception as e:
-        st.warning(f"Could not process JSON file {file_path}: {e}")
+        st.warning(f"Could not process JSON file {Path(file_path).name}: {e}")
         return None
 
-# --- UPDATED: Enhanced ingest_logs function ---
-def ingest_logs(file_path, file_type=None):
+# --- UPDATED: Enhanced ingest_logs function with streaming ---
+def ingest_logs(file_path, file_type=None, use_streaming=True):
     try:
         if file_type is None:
             file_type = Path(file_path).suffix.lower()
         
+        file_name = os.path.basename(file_path)
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        
         # Handle files without extensions or unknown extensions
         if file_type == '' or file_type not in SUPPORTED_EXTENSIONS:
-            st.write(f"🔍 Detecting file type for: {os.path.basename(file_path)}")
+            st.write(f"🔍 Detecting file type for: {file_name}")
             detected_type = detect_file_type(file_path)
             
             if detected_type == 'csv':
@@ -723,26 +1082,65 @@ def ingest_logs(file_path, file_type=None):
                 file_type = '.log'  # Default to text log processing
                 st.write("📝 Detected as text log file")
         
-        st.write(f"📄 Processing as {SUPPORTED_EXTENSIONS.get(file_type, 'Text File')}...")
+        st.write(f"📄 Processing as {SUPPORTED_EXTENSIONS.get(file_type, 'Text File')} ({file_size_mb:.1f} MB)...")
         
-        if file_type == '.csv':
+        # Use streaming for large files (> 10MB) or when explicitly requested
+        if file_size_mb > 10 and use_streaming and file_type == '.csv':
+            st.write("📊 Using streaming CSV processing for large file...")
+            
+            # Get first chunk to return something immediately
+            for df_chunk in process_csv_in_streaming_chunks(file_path):
+                if not df_chunk.empty:
+                    st.write(f"✅ First chunk ready with {len(df_chunk):,} rows")
+                    return df_chunk
+            
+            st.write("ℹ️ No relevant data found in streaming processing")
+            return None
+        
+        elif file_type == '.csv':
             st.write("📊 Processing CSV file...")
-            df = pd.read_csv(
-                file_path,
-                delimiter=',',
-                quoting=3,
-                encoding='utf-8',
-                on_bad_lines='skip',
-                engine='python'
-            )
-            st.write(f"📈 Loaded {len(df)} rows from CSV")
             
-            st.write("🔍 Filtering for security-related events...")
-            initial_count = len(df)
-            df = df[df.apply(lambda row: row.astype(str).str.contains('login|error|access|failed|security|audit|authentication|denied|warning|alert', case=False, na=False).any(), axis=1)]
-            filtered_count = len(df)
-            st.write(f"✅ Filtered to {filtered_count} security-relevant rows (from {initial_count} total)")
-            
+            if file_size_mb > 50 and use_streaming:
+                st.write("📊 Using streaming CSV processing...")
+                all_chunks = []
+                total_rows = 0
+                
+                for df_chunk in process_csv_in_streaming_chunks(file_path):
+                    if not df_chunk.empty:
+                        all_chunks.append(df_chunk)
+                        total_rows += len(df_chunk)
+                        st.write(f"🔄 Processed chunk with {len(df_chunk):,} rows (Total: {total_rows:,})")
+                
+                if all_chunks:
+                    df = pd.concat(all_chunks, ignore_index=True)
+                    st.write(f"✅ Combined {len(all_chunks)} chunks into {len(df):,} total rows")
+                    return df
+                else:
+                    st.write("ℹ️ No security-relevant data found")
+                    return None
+            else:
+                # For smaller files
+                df = pd.read_csv(
+                    file_path,
+                    delimiter=',',
+                    quoting=3,
+                    encoding='utf-8',
+                    on_bad_lines='skip',
+                    engine='python',
+                    low_memory=True
+                )
+                
+                st.write(f"📈 Loaded {len(df):,} rows from CSV")
+                
+                if not df.empty:
+                    security_keywords = 'login|error|access|failed|security|audit|authentication|denied|warning|alert'
+                    combined_text = df.astype(str).agg(' '.join, axis=1)
+                    df = df[combined_text.str.contains(security_keywords, case=False, na=False)]
+                    st.write(f"✅ Filtered to {len(df):,} security-relevant rows")
+                    return df
+                else:
+                    return None
+        
         elif file_type == '.evtx':
             if PyEvtxParser is None:
                 raise ValueError(".evtx support is disabled. Please install: pip install python-evtx")
@@ -757,7 +1155,7 @@ def ingest_logs(file_path, file_type=None):
             st.write(f"📋 Found {record_count} event records in EVTX file")
             
             security_event_ids = [
-                4624, 4625, 4648, 4672, 4720, 4722, 4723, 4724, 4725, 4726, 
+                4624, 4625, 4648, 4672, 4720, 4722, 4723, 4724, 4725, 4726,
                 4732, 4733, 4738, 4740, 4756, 4768, 4776, 4611, 4649, 4657
             ]
             
@@ -773,11 +1171,12 @@ def ingest_logs(file_path, file_type=None):
                         'event_id': event_id,
                         'event_data': str(event_data.get('EventData', {})),
                         'message': f"EventID {event_id}: {event_data.get('EventData', {})}",
-                        'file': os.path.basename(file_path)
+                        'file': file_name
                     })
             
             df = pd.DataFrame(events)
             st.write(f"✅ Extracted {len(df)} security-related Windows events")
+            return df
             
         elif file_type == '.json':
             df = process_json_file(file_path)
@@ -785,13 +1184,15 @@ def ingest_logs(file_path, file_type=None):
                 st.write(f"✅ Processed JSON file with {len(df)} security-relevant entries")
             else:
                 st.write("ℹ️ No security-relevant data found in JSON file")
+            return df
                 
-        elif file_type in ['.log', '.txt', '.syslog', '']:  # Added '' for no extension
+        elif file_type in ['.log', '.txt', '.syslog', '']:
             df = process_text_file(file_path)
             if df is not None:
                 st.write(f"✅ Processed text file with {len(df)} security-relevant lines")
             else:
                 st.write("ℹ️ No security-relevant data found in text file")
+            return df
                 
         elif file_type == '.xml':
             df = process_text_file(file_path)
@@ -799,37 +1200,48 @@ def ingest_logs(file_path, file_type=None):
                 st.write(f"✅ Processed XML file with {len(df)} security-relevant entries")
             else:
                 st.write("ℹ️ No security-relevant data found in XML file")
+            return df
                 
         else:
             st.warning(f"Unsupported file type: {file_type}")
             return None
         
-        return df
     except Exception as e:
-        st.error(f"❌ Error reading log file {file_path}: {str(e)}")
+        st.error(f"❌ Error reading log file {file_name}: {str(e)}")
         return None
 
-def chunk_logs(df):
+# --- NEW: Optimized chunk_logs function ---
+def chunk_logs(df, use_streaming=True):
     try:
-        st.write("✂️ Chunking log data for processing...")
-        
-        text = df.to_string(index=False)
-        
-        data_size = len(text)
-        if data_size > 1000000:
-            chunk_size = 3000
-            chunk_overlap = 300
+        if use_streaming and len(df) > 10000:
+            st.write("✂️ Using streaming chunk generation...")
+            chunks_generator = chunk_logs_streaming(df)
+            chunks = list(chunks_generator)
         else:
-            chunk_size = 2000
-            chunk_overlap = 200
+            st.write("✂️ Chunking log data...")
             
-        st.write(f"📏 Data size: {data_size} characters, using chunk size: {chunk_size}")
-        
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size, 
-            chunk_overlap=chunk_overlap
-        )
-        chunks = splitter.split_text(text)
+            if 'file' in df.columns:
+                df_to_string = df.drop(columns=['file'], errors='ignore')
+            else:
+                df_to_string = df
+            
+            text = df_to_string.to_string(index=False)
+            
+            data_size = len(text)
+            if data_size > 1000000:
+                chunk_size = 3000
+                chunk_overlap = 300
+            else:
+                chunk_size = 2000
+                chunk_overlap = 200
+                
+            st.write(f"📏 Data size: {data_size} characters, using chunk size: {chunk_size}")
+            
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap
+            )
+            chunks = splitter.split_text(text)
         
         st.write(f"✅ Created {len(chunks)} chunks for analysis")
         return chunks
@@ -837,56 +1249,81 @@ def chunk_logs(df):
         st.error(f"❌ Error chunking logs: {str(e)}")
         return []
 
-def build_vector_store(chunks, config, ollama_url):
-    # --- NEW: Create a unique temporary directory ---
+# --- UPDATED: build_vector_store with streaming support ---
+def build_vector_store(chunks, config, ollama_url, use_streaming=True):
+    """Build vector store, optionally using streaming with optimized batch sizes"""
     persist_directory = tempfile.mkdtemp()
-    st.write(f"🔧 Using temporary vector store directory: {persist_directory}")
-    # --- END NEW ---
-
+    st.write(f"🔧 Using temporary vector store directory: {Path(persist_directory).name}")
+    
     try:
-        st.write("🔧 Building vector store for semantic search...")
-
-        st.write(f"🌍 Using local embedding model: {config['embedding_model']}")
-        try:
+        st.write("🔧 Building vector store...")
+        
+        if use_streaming and len(chunks) > 50:
+            st.write("🌍 Using incremental vector store building...")
+            
+            # Determine optimal batch size based on GPU
+            optimal_batch_size = determine_optimal_batch_size(st.session_state.gpu_info)
+            
+            # Create a generator from chunks
+            def chunks_generator():
+                for i, chunk in enumerate(chunks):
+                    yield chunk
+                    if i % 100 == 0 and i > 0:  # Update less frequently for better performance
+                        st.write(f"📚 Generated {i+1}/{len(chunks)} chunks")
+            
+            # Build incrementally with optimized batch size
+            result = build_vector_store_incrementally(
+                chunks_generator(), 
+                config, 
+                ollama_url,
+                batch_size=optimal_batch_size
+            )
+            
+            if result['status'] == 'complete':
+                return result['vectorstore'], result['persist_dir']
+            else:
+                raise Exception(f"Vector store build failed: {result.get('error')}")
+        
+        else:
+            # Original non-streaming approach for small files
             embeddings = OllamaEmbeddings(
                 model=config['embedding_model'],
                 base_url=ollama_url
             )
             _ = embeddings.embed_query("Test embedding")
-        except Exception as e:
-            st.error(f"❌ Error initializing Ollama embeddings: {e}")
-            st.error(f"💡 Make sure you have the model installed locally. Try: `ollama pull {config['embedding_model']}`")
-            # --- NEW: Clean up directory on embedding failure ---
-            if os.path.exists(persist_directory):
-                shutil.rmtree(persist_directory)
-            # --- END NEW ---
-            return None, None # Return None for both store and dir
-
-        docs = [Document(page_content=chunk) for chunk in chunks]
-        st.write(f"📚 Creating embeddings for {len(docs)} documents...")
-
-        collection_name = "log_analysis" # Can use a fixed name now
-
-        # --- UPDATED: Use persist_directory ---
-        vectorstore = Chroma.from_documents(
-            docs,
-            embeddings,
-            collection_name=collection_name,
-            persist_directory=persist_directory # Use the temp dir
-        )
-        # --- END UPDATE ---
-
-        st.write("✅ Vector store created successfully!")
-        # --- UPDATED: Return directory path for cleanup ---
-        return vectorstore, persist_directory
-
+            
+            docs = [Document(page_content=chunk) for chunk in chunks]
+            st.write(f"📚 Creating embeddings for {len(docs)} documents...")
+            
+            # For non-streaming, use larger batch size if we have GPU
+            if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+                # Process in larger batches even for non-streaming
+                vectorstore = Chroma.from_documents(
+                    docs,
+                    embeddings,
+                    collection_name="log_analysis",
+                    persist_directory=persist_directory,
+                    collection_metadata={"hnsw:batch_size": "100"}  # Suggest larger batches
+                )
+            else:
+                vectorstore = Chroma.from_documents(
+                    docs,
+                    embeddings,
+                    collection_name="log_analysis",
+                    persist_directory=persist_directory
+                )
+            
+            st.write("✅ Vector store created successfully!")
+            return vectorstore, persist_directory
+            
     except Exception as e:
         st.error(f"❌ Error initializing ChromaDB vector store: {str(e)}")
-        # --- NEW: Clean up directory on general failure ---
         if os.path.exists(persist_directory):
-            shutil.rmtree(persist_directory)
-        # --- END NEW ---
-        return None, None # Return None for both
+            try:
+                shutil.rmtree(persist_directory)
+            except:
+                pass
+        return None, None
 
 # --- NEW, FASTER "MAP REDUCE" VERSION ---
 def analyze_logs(vectorstore, llm, user_prompt_template):
@@ -897,11 +1334,9 @@ def analyze_logs(vectorstore, llm, user_prompt_template):
 
         # --- 1. VALIDATE PROMPT ---
         if "{context}" not in user_prompt_template or "{question}" not in user_prompt_template:
-            st.error("❌ Prompt Error: The prompt template must include `{context}` and `{question}` placeholders.")
-            return "Analysis failed: Prompt template is missing required placeholders."
+            raise ValueError("Prompt template must include {context} and {question} placeholders.")
 
         # --- 2. "MAP" STEP ---
-        # This prompt will be sent to the LLM for EACH chunk in parallel.
         map_prompt_template = """
         You are a DFIR analyst. Your job is to find security incidents in a single log chunk.
         Analyze the log data below and list ONLY the key findings, potential IOCs, and any suspicious activity.
@@ -911,26 +1346,18 @@ def analyze_logs(vectorstore, llm, user_prompt_template):
         {context}
         """
         map_prompt = ChatPromptTemplate.from_template(map_prompt_template)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 5}) 
 
-        # This is the "Map" chain.
-        # It retrieves docs, then runs the `map_prompt | llm` on EACH doc in parallel.
         map_chain = (
             retriever
             | RunnableLambda(lambda docs: [{"context": doc.page_content} for doc in docs])
-            | map_prompt.map() # .map() runs the prompt on each item in the list
-            | llm.map()        # .map() runs the LLM on each prompt output
+            | map_prompt.map()
+            | llm.map()
         )
         
-        # --- 3. "REDUCE" STEP ---
-        # This prompt combines the parallel summaries into the final report.
-        # We re-use your main prompt from the config.
+        # 3. "REDUCE" STEP (Final Report Generation)
         reduce_prompt = ChatPromptTemplate.from_template(user_prompt_template)
 
-        # This chain runs the "Map" step first, then...
-        # 1. Takes the list of parallel summaries
-        # 2. Joins them into a single string
-        # 3. Passes them as "context" to your final "Reduce" prompt.
         chain = (
             map_chain
             | RunnableLambda(lambda summaries: "\n\n---\n\n".join([s.content if hasattr(s, 'content') else str(s) for s in summaries]))
@@ -940,10 +1367,9 @@ def analyze_logs(vectorstore, llm, user_prompt_template):
         )
 
         with st.spinner("🧠 AI analysis in progress... (Parallel Map Reduce)"):
-            # We ask a general question, as the prompts are now hard-coded for this strategy
             result = chain.invoke("Analyze these logs thoroughly for any security incidents, anomalies, or signs of compromise.")
         
-        # --- 4. FORMAT OUTPUT ---
+        # 4. FORMAT OUTPUT
         if hasattr(result, 'content'):
             return str(result.content)
         elif hasattr(result, 'text'):
@@ -957,92 +1383,79 @@ def analyze_logs(vectorstore, llm, user_prompt_template):
         st.error(f"❌ Error during analysis: {str(e)}")
         return f"Analysis failed for this file: {str(e)}"
 
-def process_single_file(file_path, file_extension, llm, config, ollama_url, analysis_prompt):
-    """Process a single file through the analysis pipeline"""
-    vectorstore = None
-    persist_dir = None # Initialize directory path
-    try:
-        with st.status("🚀 Processing pipeline started...", expanded=True) as status:
-            status.write("📥 **Step 1:** Ingesting log file...")
-            df = ingest_logs(file_path, file_type=f".{file_extension}")
+# --- NEW FUNCTION: Executive Summary Pass (Second Reduce) ---
+def generate_executive_summary(processed_files_data, llm):
+    """
+    Takes a list of individual file reports and generates a final executive summary
+    with actionable intelligence linked to the source file.
+    """
+    st.info("📈 **Finalizing Report:** Consolidating individual analysis...")
 
-            if st.session_state.job_status != 'running':
-                status.write("⏹️ Analysis stopped by user")
-                return
+    # 1. Compile all reports into one context string
+    full_analysis_context = ""
+    success_count = 0
+    for item in processed_files_data:
+        if item.get('status') == 'success' and item.get('report'):
+            file_path = item['path']
+            report_content = item['report']
+            
+            full_analysis_context += f"===== START OF ANALYSIS FOR FILE: {file_path} =====\n"
+            full_analysis_context += report_content
+            full_analysis_context += f"\n===== END OF ANALYSIS FOR FILE: {file_path} =====\n\n"
+            success_count += 1
+        
+    if success_count == 0:
+        return "No threats or relevant security findings were identified in the successfully processed files."
+        
+    st.write(f"Synthesizing findings from {success_count} reports...")
 
-            if df is not None and not df.empty:
-                status.write("✅ **Step 1 Complete:** Log ingestion successful")
+    # 2. Define the Final Reduce Prompt
+    final_reduce_prompt_template = """
+    You are a Lead DFIR Analyst. You are given a comprehensive analysis that spans multiple log files.
+    Your task is to synthesize this information into a single, high-level Executive Summary.
 
-                status.write("✂️ **Step 2:** Chunking data for analysis...")
-                chunks = chunk_logs(df)
+    Critically, for every key finding or IOC, you MUST reference the specific source file name 
+    (provided in the analysis headers, e.g., 'FILE: auth.log') where that finding originated. 
+    Use the file name as a direct reference in brackets or parentheses.
 
-                if st.session_state.job_status != 'running':
-                    status.write("⏹️ Analysis stopped by user")
-                    return
+    Provide the final output with the following sections:
 
-                if chunks:
-                    status.write("✅ **Step 2 Complete:** Data chunking successful")
+    1.  **HIGH-LEVEL EXECUTIVE SUMMARY:** A paragraph summarizing the overall security posture and main threat.
+    2.  **ACTIONABLE INTELLIGENCE SUMMARY (Linked to Source):**
+        * List the top 3-5 critical security events or IOCs, ensuring all files are reviewed.
+        * Each entry MUST include the file name.
+        * Example Format:
+            - **CRITICAL:** High volume of failed SSH logins from IP 1.2.3.4 (Source: secure.log)
+            - **HIGH:** User 'JSmith' was created and immediately disabled (Source: System.evtx)
+            - **MEDIUM:** Suspicious file 'amcache.exe' found in temp directory (Source: AmCache File Entries.csv)
+    3.  **OVERALL RECOMMENDATIONS:** Concrete, immediate steps for triage and mitigation.
 
-                    status.write("🔧 **Step 3:** Building semantic search index...")
-                    # --- UPDATED: Get persist_dir back ---
-                    vectorstore, persist_dir = build_vector_store(chunks, config, ollama_url)
+    Context (All Individual File Reports):
+    {context}
+    """
+    
+    final_prompt = ChatPromptTemplate.from_template(final_reduce_prompt_template)
 
-                    if st.session_state.job_status != 'running':
-                        status.write("⏹️ Analysis stopped by user")
-                        # No explicit cleanup here, finally block handles it
-                        return
+    # 3. Run the Final Chain
+    final_chain = (
+        {"context": RunnablePassthrough()}
+        | final_prompt
+        | llm
+    )
+    
+    with st.spinner("🧠 Running final Executive Summary consolidation..."):
+        result = final_chain.invoke({"context": full_analysis_context})
+        
+    if hasattr(result, 'content'):
+        return str(result.content)
+    return str(result) if result else "Consolidation failed or returned no data."
 
-                    if vectorstore: # Check if build was successful
-                        status.write("✅ **Step 3 Complete:** Vector store ready")
-
-                        status.write("🤖 **Step 4:** AI analysis with DFIR expert...")
-                        report = analyze_logs(vectorstore, llm, analysis_prompt)
-
-                        if st.session_state.job_status != 'running':
-                            status.write("⏹️ Analysis stopped by user")
-                            # No explicit cleanup here, finally block handles it
-                            return
-
-                        if report:
-                            status.write("✅ **Step 4 Complete:** Analysis complete!")
-                            st.session_state.current_report = report
-                            st.session_state.job_status = 'completed'
-                            # No explicit cleanup here, finally block handles it before rerun
-                            st.rerun()
-
-                        # No explicit vectorstore deletion needed now
-                        # st.info("🧹 Temporary data cleaned up") # Cleanup happens in finally
-
-                st.success("🎉 Analysis pipeline completed successfully!")
-
-            else:
-                st.warning("⚠️ No relevant log data found or file is empty.")
-                st.session_state.job_status = 'completed'
-                st.rerun()
-
-    except Exception as e:
-        st.error(f"❌ Error during analysis: {str(e)}")
-        st.session_state.job_status = 'stopped'
-        # Rerun will happen after finally block
-
-    finally:
-        # --- NEW: Ensure temporary directory is always cleaned up ---
-        if persist_dir and os.path.exists(persist_dir):
-            try:
-                shutil.rmtree(persist_dir)
-                st.info(f"🧹 Temporary vector store directory '{persist_dir}' deleted.")
-            except Exception as del_e:
-                st.warning(f"⚠️ Could not delete temporary directory '{persist_dir}': {del_e}")
-        # Need to rerun here if an error occurred to update UI state correctly
-        if st.session_state.job_status == 'stopped':
-             st.rerun()
-        # --- END NEW ---
-
+# --- UPDATED: process_file_queue function with enhanced storage ---
 def process_file_queue(llm, config, ollama_url, analysis_prompt):
-    """Process multiple files from the queue"""
+    """Process multiple files from the queue with enhanced storage"""
     if not st.session_state.file_queue:
         st.session_state.job_status = 'completed'
-        st.success("🎉 All files processed successfully!")
+        st.success("🎉 File processing pipeline finished. Generating reports...")
         st.rerun()
         return
 
@@ -1057,47 +1470,66 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
     st.write(f"🎯 **Using Model:** {config['model']} ({category_desc})")
 
     vectorstore = None
-    persist_dir = None # Initialize directory path
+    persist_dir = None
+    
+    # Enhanced file result structure
+    file_result = {
+        'path': current_file_info['relative_path'],
+        'name': current_file_info['name'],
+        'size': current_file_info['size'],
+        'extension': file_extension,
+        'report': "Analysis skipped: No relevant data found or ingestion failed.",
+        'status': 'skipped',
+        'chunks_processed': 0,
+        'analysis_timestamp': datetime.datetime.now().isoformat(),
+        'model_used': config['model'],
+        'embedding_model': config['embedding_model']
+    }
+
     try:
         with st.status(f"🚀 Processing {current_file_info['name']}...", expanded=True) as status:
             status.write("📥 **Step 1:** Ingesting log file...")
-            df = ingest_logs(file_path, file_type=file_extension)
+            
+            # Determine if we should use streaming based on file size
+            file_size_mb = current_file_info['size'] / (1024 * 1024)
+            use_streaming = file_size_mb > 10
+            
+            df = ingest_logs(file_path, file_type=file_extension, use_streaming=use_streaming)
 
             if st.session_state.job_status != 'running':
                 status.write("⏹️ Analysis stopped by user")
                 st.session_state.file_queue.insert(0, current_file_info)
-                # No explicit cleanup here, finally block handles it
-                st.rerun()
                 return
 
             if df is not None and not df.empty:
-                status.write("✅ **Step 1 Complete:** Log ingestion successful")
+                status.write(f"✅ **Step 1 Complete:** Ingested {len(df):,} rows")
+                file_result['rows_ingested'] = len(df)
 
-                status.write("✂️ **Step 2:** Chunking data for analysis...")
-                chunks = chunk_logs(df)
+                status.write("✂️ **Step 2:** Chunking data...")
+                # Use streaming chunking for large data
+                use_chunk_streaming = len(df) > 10000
+                chunks = chunk_logs(df, use_streaming=use_chunk_streaming)
 
                 if st.session_state.job_status != 'running':
                     status.write("⏹️ Analysis stopped by user")
                     st.session_state.file_queue.insert(0, current_file_info)
-                    # No explicit cleanup here, finally block handles it
-                    st.rerun()
                     return
 
                 if chunks:
-                    status.write("✅ **Step 2 Complete:** Data chunking successful")
+                    status.write(f"✅ **Step 2 Complete:** Created {len(chunks)} chunks")
+                    file_result['chunks_processed'] = len(chunks)
 
                     status.write("🔧 **Step 3:** Building semantic search index...")
-                    # --- UPDATED: Get persist_dir back ---
-                    vectorstore, persist_dir = build_vector_store(chunks, config, ollama_url)
+                    # Use streaming vector store for large chunk counts
+                    use_vector_streaming = len(chunks) > 50
+                    vectorstore, persist_dir = build_vector_store(chunks, config, ollama_url, use_streaming=use_vector_streaming)
 
                     if st.session_state.job_status != 'running':
                         status.write("⏹️ Analysis stopped by user")
                         st.session_state.file_queue.insert(0, current_file_info)
-                        # No explicit cleanup here, finally block handles it
-                        st.rerun()
                         return
 
-                    if vectorstore: # Check if build succeeded
+                    if vectorstore:
                         status.write("✅ **Step 3 Complete:** Vector store ready")
 
                         status.write("🤖 **Step 4:** AI analysis with DFIR expert...")
@@ -1106,68 +1538,220 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
                         if st.session_state.job_status != 'running':
                             status.write("⏹️ Analysis stopped by user")
                             st.session_state.file_queue.insert(0, current_file_info)
-                             # No explicit cleanup here, finally block handles it
-                            st.rerun()
                             return
 
                         if report:
                             status.write("✅ **Step 4 Complete:** Analysis complete!")
 
-                            report_str = str(report) if not isinstance(report, str) else report
-                            file_header = f"\n\n{'='*80}\nFILE: {current_file_info['relative_path']}\n{'='*80}\n"
+                            # Store enhanced report data
+                            file_result['report'] = str(report) if not isinstance(report, str) else report
+                            file_result['status'] = 'success'
+                            file_result['analysis_complete'] = True
+                        
+                        # Clean up vector store
+                        try:
+                            status.write("🧹 Releasing vector store file lock...")
+                            if vectorstore:
+                                vectorstore._collection = None
+                            del vectorstore
+                            vectorstore = None
+                            gc.collect()
+                            time.sleep(0.1)
+                            status.write("✅ File lock released")
+                        except Exception as close_e:
+                            status.warning(f"⚠️ Could not explicitly close vector store: {close_e}")
 
-                            if st.session_state.current_report:
-                                st.session_state.current_report += file_header + report_str
-                            else:
-                                st.session_state.current_report = f"BULK ANALYSIS REPORT\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nTotal Files: {len(st.session_state.processed_files) + len(st.session_state.file_queue) + 1}\n{file_header}{report_str}"
+                    status.write("✅ File processing completed!")
 
-                            st.session_state.processed_files.append(current_file_info)
-
-                        # No explicit vectorstore deletion needed now
-
-                status.write("✅ File processing completed!")
-
+                else:
+                    status.write("ℹ️ No relevant data chunks created.")
+            
             else:
                 status.write("ℹ️ No relevant data found in this file.")
-                st.session_state.processed_files.append(current_file_info) # Mark as processed even if empty
 
     except Exception as e:
-        st.error(f"❌ Error processing {current_file_info['name']}: {str(e)}")
-        st.session_state.processed_files.append(current_file_info) # Mark as processed even on error
-        # Let the finally block handle cleanup before deciding next step
+        status.error(f"❌ Error processing {current_file_info['name']}: {str(e)}")
+        file_result['report'] = f"Processing failed due to error: {str(e)}"
+        file_result['status'] = 'error'
+        file_result['error_message'] = str(e)
 
     finally:
-        # --- NEW: Ensure temporary directory is always cleaned up ---
+        # Add the enhanced result to the processed list
+        st.session_state.processed_files.append(file_result)
+        
+        # Ensure temporary directory is always cleaned up
         if persist_dir and os.path.exists(persist_dir):
             try:
                 shutil.rmtree(persist_dir)
-                st.info(f"🧹 Temporary vector store directory '{persist_dir}' deleted.")
+                st.info(f"🧹 Temporary vector store directory deleted.")
             except Exception as del_e:
-                st.warning(f"⚠️ Could not delete temporary directory '{persist_dir}': {del_e}")
-        # --- END NEW ---
+                st.warning(f"⚠️ Could not delete directory: {del_e}")
 
-        # Continue with next file or complete only AFTER cleanup
-        if st.session_state.job_status == 'running': # Only proceed if not stopped
+        # Continue with next file or complete
+        if st.session_state.job_status == 'running':
             if st.session_state.file_queue:
                 st.rerun() # Continue with next file
             else:
-                # All files processed - update status and show final report
                 st.session_state.job_status = 'completed'
-                st.success("🎉 All files processed successfully!")
-                st.rerun() # Force UI to show the completed state and report
-        elif st.session_state.job_status == 'stopped': # If stopped during processing
-             st.warning("Analysis stopped by user during file processing.")
-             st.rerun() # Update UI to reflect stopped state
+                st.rerun()
+        elif st.session_state.job_status == 'stopped':
+            st.warning("Analysis stopped by user during file processing.")
+            st.rerun()
+
+# --- NEW: Streaming file processing function with GPU optimization ---
+def process_single_file_streaming(file_path, file_extension, llm, config, ollama_url, analysis_prompt):
+    """Process a single file using streaming approach with GPU optimization"""
+    vectorstore = None
+    persist_dir = None
+    
+    # Enhanced file result structure
+    file_result = {
+        'path': os.path.basename(file_path),
+        'name': os.path.basename(file_path),
+        'size': os.path.getsize(file_path),
+        'extension': file_extension,
+        'report': "Analysis skipped: No relevant data found or ingestion failed.",
+        'status': 'skipped',
+        'chunks_processed': 0,
+        'analysis_timestamp': datetime.datetime.now().isoformat(),
+        'model_used': config['model'],
+        'embedding_model': config['embedding_model']
+    }
+    
+    try:
+        with st.status("🚀 Starting streaming pipeline...", expanded=True) as status:
+            # Show GPU info if available
+            if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+                gpu_name = st.session_state.gpu_info['name']
+                vram_gb = st.session_state.gpu_info['vram_gb']
+                status.write(f"🎮 **GPU:** {gpu_name} ({vram_gb:.1f}GB VRAM)")
+            
+            status.write("📥 **Step 1:** Ingesting log file...")
+            
+            # Ingest with streaming for large files
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            use_streaming = file_size_mb > 10
+            
+            df = ingest_logs(file_path, file_type=f".{file_extension}", use_streaming=use_streaming)
+
+            if st.session_state.job_status != 'running':
+                status.write("⏹️ Analysis stopped by user")
+                return
+
+            if df is not None and not df.empty:
+                status.write(f"✅ **Step 1 Complete:** Ingested {len(df):,} rows")
+                file_result['rows_ingested'] = len(df)
+
+                status.write("✂️ **Step 2:** Chunking data...")
+                # Use streaming chunking for large data
+                use_chunk_streaming = len(df) > 10000
+                chunks = chunk_logs(df, use_streaming=use_chunk_streaming)
+
+                if st.session_state.job_status != 'running':
+                    status.write("⏹️ Analysis stopped by user")
+                    return
+
+                if chunks:
+                    status.write(f"✅ **Step 2 Complete:** Created {len(chunks)} chunks")
+                    file_result['chunks_processed'] = len(chunks)
+
+                    status.write("🔧 **Step 3:** Building semantic search index...")
+                    # Use streaming vector store for large chunk counts
+                    use_vector_streaming = len(chunks) > 50
+                    
+                    # Determine optimal batch size based on GPU
+                    optimal_batch_size = determine_optimal_batch_size(st.session_state.gpu_info)
+                    status.write(f"⚡ **Batch Optimization:** Using batch size of {optimal_batch_size} for GPU efficiency")
+                    
+                    # Monitor GPU before starting
+                    gpu_stats_before = monitor_gpu_utilization()
+                    if gpu_stats_before:
+                        status.write(f"📊 **GPU Before:** {gpu_stats_before['utilization_percent']}% util, "
+                                    f"{gpu_stats_before['memory_allocated_gb']:.1f}GB used")
+                    
+                    vectorstore, persist_dir = build_vector_store(chunks, config, ollama_url, use_streaming=use_vector_streaming)
+
+                    if st.session_state.job_status != 'running':
+                        status.write("⏹️ Analysis stopped by user")
+                        return
+
+                    # Monitor GPU after building
+                    gpu_stats_after = monitor_gpu_utilization()
+                    if gpu_stats_after and gpu_stats_before:
+                        utilization_change = gpu_stats_after['utilization_percent'] - gpu_stats_before['utilization_percent']
+                        memory_change = gpu_stats_after['memory_allocated_gb'] - gpu_stats_before['memory_allocated_gb']
+                        status.write(f"📊 **GPU After:** {gpu_stats_after['utilization_percent']}% util "
+                                    f"(Δ{utilization_change:+d}%), "
+                                    f"{gpu_stats_after['memory_allocated_gb']:.1f}GB used "
+                                    f"(Δ{memory_change:+.1f}GB)")
+
+                    if vectorstore:
+                        status.write("✅ **Step 3 Complete:** Vector store ready")
+
+                        status.write("🤖 **Step 4:** AI analysis with DFIR expert...")
+                        report = analyze_logs(vectorstore, llm, analysis_prompt)
+
+                        if st.session_state.job_status != 'running':
+                            status.write("⏹️ Analysis stopped by user")
+                            return
+
+                        if report:
+                            status.write("✅ **Step 4 Complete:** Analysis complete!")
+                            
+                            # Store enhanced results
+                            file_result['report'] = str(report) if not isinstance(report, str) else report
+                            file_result['status'] = 'success'
+                            file_result['analysis_complete'] = True
+                            
+                            # Store in session state
+                            st.session_state.current_report = report
+                            st.session_state.final_summary_generated = True
+                            st.session_state.job_status = 'completed'
+                            st.session_state.processed_files.append(file_result)
+                            
+                        status.success("🎉 Streaming pipeline completed successfully!")
+
+                else:
+                    status.write("ℹ️ No relevant data chunks created.")
+                    st.session_state.job_status = 'completed'
+            
+            else:
+                status.write("ℹ️ No relevant data found in this file.")
+                st.session_state.job_status = 'completed'
+                
+    except Exception as e:
+        st.error(f"❌ Error during streaming analysis: {str(e)}")
+        st.session_state.job_status = 'stopped'
+    
+    finally:
+        # Cleanup
+        if persist_dir and os.path.exists(persist_dir):
+            try:
+                # Close vector store first
+                if vectorstore:
+                    try:
+                        vectorstore._client.heartbeat()
+                        vectorstore._collection = None
+                    except:
+                        pass
+                
+                # Delete directory
+                shutil.rmtree(persist_dir)
+                st.info(f"🧹 Temporary vector store directory deleted.")
+            except Exception as del_e:
+                st.warning(f"⚠️ Could not delete directory: {del_e}")
+        
+        if st.session_state.job_status == 'stopped':
+            st.rerun()
 
 def main():
-    # Set page config. This MUST be the first Streamlit command.
+    # Set page config
     st.set_page_config(
         page_title="ForensIQ",
         page_icon="🧠",
         layout="wide"
     )
 
-    # Updated title and subtitle
     st.title("🧠 ForensIQ")
     st.write("AI-powered log analysis, brought to you by **[DFIR Vault](https://dfirvault.com)**.")
 
@@ -1191,17 +1775,28 @@ def main():
             st.session_state.gpu_info = detect_gpu()
         except:
             st.session_state.gpu_info = {"available": False, "name": "Detection failed", "vram_gb": 0, "recommended_model": "llama3.2:3b-instruct-q4_0"}
-    # --- NEW: Initialize selected_folders list ---
     if 'selected_folders' not in st.session_state:
         st.session_state.selected_folders = []
-    # --- NEW: Initialize selected_files list for multiple file selection ---
     if 'selected_files' not in st.session_state:
         st.session_state.selected_files = []
+    if 'final_summary_generated' not in st.session_state:
+        st.session_state.final_summary_generated = False
+    # --- NEW: State for optimal batch size ---
+    if 'optimal_batch_size' not in st.session_state:
+        st.session_state.optimal_batch_size = 200  # Default increased from 10
+    # --- END NEW ---
+    # --- NEW: State for streaming thresholds ---
+    if 'streaming_thresholds' not in st.session_state:
+        st.session_state.streaming_thresholds = {
+            'csv_mb': 10,
+            'chunk_rows': 10000,
+            'vector_chunks': 50
+        }
     # --- END NEW ---
 
     config = st.session_state.config
 
-    # Configuration section (NO CHANGES IN THIS SECTION)
+    # Configuration section
     with st.expander("🔧 Configuration", expanded=True):
         col1, col2 = st.columns(2)
         with col1:
@@ -1232,9 +1827,16 @@ def main():
         st.write("---")
         st.write("**🎮 GPU Information:**")
         if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
-            st.success(f"✅ GPU Detected: {st.session_state.gpu_info['name']}")
-            st.write(f"- **VRAM:** {st.session_state.gpu_info['vram_gb']:.1f} GB")
+            gpu_name = st.session_state.gpu_info['name']
+            vram_gb = st.session_state.gpu_info['vram_gb']
+            st.success(f"✅ GPU Detected: {gpu_name}")
+            st.write(f"- **VRAM:** {vram_gb:.1f} GB")
             st.write(f"- **Recommended Model:** {st.session_state.gpu_info['recommended_model']}")
+            
+            # Calculate and display optimal batch size
+            optimal_batch = determine_optimal_batch_size(st.session_state.gpu_info)
+            st.write(f"- **Optimal Batch Size:** {optimal_batch} documents")
+            st.session_state.optimal_batch_size = optimal_batch
 
             if st.button("🎯 Use Recommended GPU Model", use_container_width=True):
                 config['model'] = st.session_state.gpu_info['recommended_model']
@@ -1246,6 +1848,71 @@ def main():
             st.warning("⚠️ No GPU detected - using CPU mode")
             st.info("💡 For faster analysis, ensure you have a compatible GPU and drivers installed")
 
+        # Performance Optimization Settings
+        st.write("---")
+        st.subheader("⚡ Performance Optimization")
+        
+        # Batch size control
+        if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+            default_batch_size = st.session_state.optimal_batch_size
+            batch_size = st.slider(
+                "Embedding Batch Size",
+                min_value=10,
+                max_value=1000,
+                value=default_batch_size,
+                step=10,
+                help="Larger batches improve GPU utilization but use more memory. Adjust based on your GPU VRAM."
+            )
+            st.session_state.optimal_batch_size = batch_size
+            
+            # Display recommended settings based on VRAM
+            vram_gb = st.session_state.gpu_info['vram_gb']
+            if vram_gb >= 16:
+                recommended = "500-1000"
+            elif vram_gb >= 8:
+                recommended = "250-500"
+            elif vram_gb >= 4:
+                recommended = "100-250"
+            else:
+                recommended = "50-100"
+            
+            st.info(f"💡 Recommended range for {vram_gb:.1f}GB VRAM: {recommended} documents/batch")
+            
+            # Streaming thresholds
+            st.write("**📊 Streaming Thresholds:**")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                csv_threshold = st.number_input(
+                    "CSV Streaming (MB)",
+                    min_value=1,
+                    max_value=1000,
+                    value=10,
+                    help="Use streaming for CSV files larger than this (MB)"
+                )
+            with col2:
+                chunk_threshold = st.number_input(
+                    "Chunk Streaming (rows)",
+                    min_value=1000,
+                    max_value=100000,
+                    value=10000,
+                    step=1000,
+                    help="Use streaming chunking for DataFrames larger than this"
+                )
+            with col3:
+                vector_threshold = st.number_input(
+                    "Vector Streaming (chunks)",
+                    min_value=10,
+                    max_value=1000,
+                    value=50,
+                    help="Use incremental vector building for chunk counts larger than this"
+                )
+            
+            st.session_state.streaming_thresholds = {
+                'csv_mb': csv_threshold,
+                'chunk_rows': chunk_threshold,
+                'vector_chunks': vector_threshold
+            }
+        
         # Refresh models button
         col1, col2 = st.columns([3, 1])
         with col2:
@@ -1253,6 +1920,8 @@ def main():
                 st.session_state.connection_info = None
                 try:
                     st.session_state.gpu_info = detect_gpu()
+                    # Recalculate optimal batch size
+                    st.session_state.optimal_batch_size = determine_optimal_batch_size(st.session_state.gpu_info)
                 except:
                     st.session_state.gpu_info = {"available": False, "name": "Detection failed", "vram_gb": 0, "recommended_model": "llama3.2:3b-instruct-q4_0"}
 
@@ -1357,6 +2026,9 @@ def main():
             st.write(f"- **Selected LLM Model:** {config['model']} ({category_desc})")
         if config.get('embedding_model'):
             st.write(f"- **Embedding Model:** {config['embedding_model']}")
+        if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+            st.write(f"- **GPU:** {st.session_state.gpu_info['name']} ({st.session_state.gpu_info['vram_gb']:.1f}GB)")
+            st.write(f"- **Batch Size:** {st.session_state.optimal_batch_size} documents")
         st.write(f"- **Last Run:** {config.get('last_run', 'Never')}")
 
         if st.button("💾 Save Configuration", use_container_width=True):
@@ -1379,115 +2051,72 @@ def main():
 
         if st.button("💾 Save Prompt to Config", use_container_width=True):
             if "{context}" not in st.session_state.prompt_editor or "{question}" not in st.session_state.prompt_editor:
-                st.error("❌ Cannot save: Prompt must include `{context}` and `{question}` placeholders.")
+                st.error("❌ Cannot save: Prompt must include `{context}` or `{question}` placeholders.")
             else:
                 config['dfir_prompt'] = st.session_state.prompt_editor
                 save_config(config)
-                st.session_state.config = config # Refresh session state config
+                st.session_state.config = config
                 st.success("✅ Prompt saved to config.txt!")
 
     config['last_run'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Save config without prompt, as prompt is saved separately
     config_copy = config.copy()
     config_copy.pop('dfir_prompt', None)
     save_config(config_copy)
-    config['dfir_prompt'] = st.session_state.prompt_editor # Ensure runtime config has latest
+    config['dfir_prompt'] = st.session_state.prompt_editor
     st.session_state.config = config
 
     # --- START OF FILE UPLOAD & ANALYSIS SECTION ---
 
-    log_files = [] # Initialize list for discovered files across all selected folders
-    total_discovered_size = 0 # Initialize total size
+    log_files = []
+    total_discovered_size = 0
     st.subheader("📁 File Upload & Analysis")
 
     upload_option = st.radio(
         "Select upload type:",
         ["Single File", "Multiple Files", "Folder (Bulk Analysis)"],
         horizontal=True,
-        key="upload_option_radio" # Add key to reset state on change
+        key="upload_option_radio"
     )
 
-    # --- Clear selection lists when switching options ---
+    # Clear selection lists and analysis state when switching options
     if upload_option != "Folder (Bulk Analysis)" and st.session_state.selected_folders:
-         st.session_state.selected_folders = []
+          st.session_state.selected_folders = []
     if upload_option != "Multiple Files" and st.session_state.selected_files:
-         st.session_state.selected_files = []
-
-    if upload_option == "Single File":
-        # Allow all files but use our content detection to filter
-        uploaded_file = st.file_uploader(
-            "Choose a log file",
-            type=None,  # Allow all files
-            help="All files are accepted. The application will detect if it's a readable log file.",
-            accept_multiple_files=False,
-            key="single_file_uploader"
-        )
-        
-        if uploaded_file:
-            # Check if the file is readable text
-            try:
-                # Try to read the first few bytes to check if it's text
-                content = uploaded_file.getvalue()
-                try:
-                    # Try to decode as UTF-8
-                    content.decode('utf-8')
-                    is_text_file = True
-                except UnicodeDecodeError:
-                    # Try other common encodings
-                    for encoding in ['latin-1', 'cp1252', 'iso-8859-1']:
-                        try:
-                            content.decode(encoding)
-                            is_text_file = True
-                            break
-                        except UnicodeDecodeError:
-                            continue
-                    else:
-                        is_text_file = False
-                
-                if is_text_file:
-                    file_info = {
-                        'path': None,
-                        'name': uploaded_file.name,
-                        'extension': uploaded_file.name.split('.')[-1].lower() if '.' in uploaded_file.name else '',
-                        'size': len(content),
-                        'relative_path': uploaded_file.name,
-                        'file_object': uploaded_file
-                    }
-                    st.session_state.selected_files = [file_info]
-                    st.success(f"✅ {uploaded_file.name} - File accepted (readable text)")
-                else:
-                    st.error(f"❌ {uploaded_file.name} - File appears to be binary or unreadable")
-                    st.session_state.selected_files = []
-                    
-            except Exception as e:
-                st.error(f"❌ Error checking file: {e}")
-                st.session_state.selected_files = []
-        else:
-            st.session_state.selected_files = []
-
-    elif upload_option == "Multiple Files":
-        # Allow all files but use our content detection to filter
+          st.session_state.selected_files = []
+    
+    # Reset final summary state if starting a new upload type
+    if st.session_state.job_status == 'idle':
+        if st.session_state.processed_files:
+            st.session_state.processed_files = []
+        if st.session_state.final_summary_generated:
+            st.session_state.final_summary_generated = False
+        if st.session_state.current_report:
+            st.session_state.current_report = None
+            
+    # File Uploaders for Single and Multiple files
+    if upload_option == "Single File" or upload_option == "Multiple Files":
         uploaded_files = st.file_uploader(
-            "Choose log files",
-            type=None,  # Allow all files
-            help="All files are accepted. The application will detect if they're readable log files.",
-            accept_multiple_files=True,
-            key="multiple_file_uploader"
+            "Choose log file(s)",
+            type=None,
+            help="All files are accepted. The application will detect if it's a readable log file.",
+            accept_multiple_files=(upload_option == "Multiple Files"),
+            key="file_uploader"
         )
         
-        if uploaded_files:
+        uploaded_files_list = uploaded_files if isinstance(uploaded_files, list) else ([uploaded_files] if uploaded_files else [])
+        
+        if uploaded_files_list:
             valid_files = []
             invalid_files = []
             
-            for uploaded_file in uploaded_files:
+            for uploaded_file in uploaded_files_list:
                 try:
                     content = uploaded_file.getvalue()
-                    # Try to detect if it's a text file
+                    is_text_file = False
                     try:
                         content.decode('utf-8')
                         is_text_file = True
                     except UnicodeDecodeError:
-                        # Try other encodings
                         for encoding in ['latin-1', 'cp1252', 'iso-8859-1']:
                             try:
                                 content.decode(encoding)
@@ -1495,9 +2124,7 @@ def main():
                                 break
                             except UnicodeDecodeError:
                                 continue
-                        else:
-                            is_text_file = False
-                    
+                            
                     if is_text_file:
                         file_info = {
                             'path': None,
@@ -1519,10 +2146,10 @@ def main():
             # Display results
             if valid_files:
                 st.success(f"✅ {len(valid_files)} files accepted as readable text")
-                st.write("**Accepted Files:**")
-                for file_info in valid_files:
-                    file_size_mb = file_info['size'] / 1024 / 1024
-                    st.write(f"- {file_info['name']} ({file_size_mb:.2f} MB)")
+                with st.expander("Accepted Files"):
+                    for file_info in valid_files:
+                        file_size_mb = file_info['size'] / 1024 / 1024
+                        st.write(f"- {file_info['name']} ({file_size_mb:.2f} MB)")
             
             if invalid_files:
                 st.warning(f"⚠️ {len(invalid_files)} files rejected (binary or unreadable)")
@@ -1542,12 +2169,12 @@ def main():
                 selected = select_folder()
                 if selected and selected not in st.session_state.selected_folders:
                     st.session_state.selected_folders.append(selected)
-                    st.rerun() # Rerun to update the displayed list and file discovery
+                    st.rerun()
 
         with col2:
-             if st.button("🗑️ Clear Folders", use_container_width=True, disabled=not st.session_state.selected_folders):
-                 st.session_state.selected_folders = []
-                 st.rerun() # Rerun to clear the list and file discovery
+              if st.button("🗑️ Clear Folders", use_container_width=True, disabled=not st.session_state.selected_folders):
+                  st.session_state.selected_folders = []
+                  st.rerun()
 
         # --- Display Selected Folders ---
         if st.session_state.selected_folders:
@@ -1563,17 +2190,15 @@ def main():
                 for folder_path in st.session_state.selected_folders:
                     if os.path.exists(folder_path):
                         discovered, size = discover_log_files(folder_path)
-                        # --- Update relative paths to include base folder for clarity ---
                         for file_info in discovered:
-                             relative_base = Path(folder_path).name # Get the last part of the folder path
-                             file_info['relative_path'] = str(Path(relative_base) / file_info['relative_path'])
-                        # --- End Update ---
+                            relative_base = Path(folder_path).name
+                            file_info['relative_path'] = str(Path(relative_base) / file_info['relative_path'])
                         all_discovered_files.extend(discovered)
                         total_discovered_size += size
                     else:
-                         st.error(f"Selected path does not exist: `{folder_path}`")
+                        st.error(f"Selected path does not exist: `{folder_path}`")
 
-                log_files = all_discovered_files # Assign combined list
+                log_files = all_discovered_files
 
             if log_files:
                 st.success(f"✅ Found **{len(log_files)}** log files ({total_discovered_size / 1024 / 1024:.2f} MB total) across all selected folders.")
@@ -1585,18 +2210,14 @@ def main():
         else:
             st.warning("No folders selected.")
 
-        uploaded_file = None # Not used in folder mode
-        # --- END MULTI-FOLDER LOGIC ---
-
     # --- START OF JOB CONTROL SECTION ---
     col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
-        # Check uses combined log_files list from multi-folder discovery OR selected_files
         has_files_to_process = (
-            (len(st.session_state.selected_files) > 0) or 
-            (len(st.session_state.file_queue) > 0) or 
-            (len(log_files) > 0)
+            (len(st.session_state.selected_files) > 0 and upload_option != "Folder (Bulk Analysis)") or
+            (len(log_files) > 0 and upload_option == "Folder (Bulk Analysis)") or
+            (len(st.session_state.file_queue) > 0)
         )
 
         if st.session_state.job_status == 'idle' and has_files_to_process:
@@ -1612,31 +2233,24 @@ def main():
                 st.session_state.current_analysis_prompt = analysis_prompt
 
                 # Queue files based on the selected option
-                if len(st.session_state.selected_files) > 0 and not st.session_state.file_queue:
-                    # Convert uploaded files to the same format as discovered files
+                if len(st.session_state.selected_files) > 0 and upload_option != "Folder (Bulk Analysis)":
                     file_queue = []
                     for file_info in st.session_state.selected_files:
-                        queue_info = {
-                            'path': None,  # Will be handled in processing
-                            'name': file_info['name'],
-                            'extension': file_info['extension'],
-                            'size': file_info['size'],
-                            'relative_path': file_info['relative_path'],
-                            'file_object': file_info['file_object']
-                        }
-                        file_queue.append(queue_info)
+                        file_queue.append(file_info)
                     
                     st.session_state.file_queue = file_queue
-                    st.session_state.processed_files = []
                     st.success(f"📋 Queued {len(file_queue)} files for analysis!")
 
-                elif len(log_files) > 0 and not st.session_state.file_queue:
+                elif len(log_files) > 0 and upload_option == "Folder (Bulk Analysis)":
                     st.session_state.file_queue = log_files
-                    st.session_state.processed_files = []
                     st.success(f"📋 Queued {len(log_files)} files from selected folder(s) for analysis!")
-
-                st.session_state.job_status = 'running'
+                
+                # Reset analysis results
+                st.session_state.processed_files = []
                 st.session_state.current_report = None
+                st.session_state.final_summary_generated = False
+                st.session_state.job_status = 'running'
+                
                 st.rerun()
 
         elif st.session_state.job_status == 'running':
@@ -1652,16 +2266,22 @@ def main():
                 st.session_state.current_file = None
                 st.session_state.file_queue = []
                 st.session_state.processed_files = []
-                st.session_state.selected_folders = [] # Clear selected folders
-                st.session_state.selected_files = [] # Clear selected files
+                st.session_state.selected_folders = []
+                st.session_state.selected_files = []
+                st.session_state.final_summary_generated = False
                 st.rerun()
 
     with col3:
-        if st.session_state.file_queue:
-            remaining = len(st.session_state.file_queue)
+        remaining = len(st.session_state.file_queue)
+        if st.session_state.job_status == 'running' and remaining > 0:
+            st.info(f"{remaining} files remaining")
+        elif st.session_state.file_queue or st.session_state.processed_files:
             if st.button(f"🗑️ Clear Queue ({remaining})", use_container_width=True, type="secondary"):
                 st.session_state.file_queue = []
                 st.session_state.processed_files = []
+                st.session_state.job_status = 'idle'
+                st.session_state.current_report = None
+                st.session_state.final_summary_generated = False
                 st.rerun()
 
     # Display job status
@@ -1674,13 +2294,11 @@ def main():
 
     st.write(f"**Job Status:** {status_emoji[st.session_state.job_status]} {st.session_state.job_status.upper()}")
 
-    if st.session_state.current_file:
-        st.write(f"**Current File:** {st.session_state.current_file}")
-
     if st.session_state.file_queue or st.session_state.processed_files:
         total_processed = len(st.session_state.processed_files)
-        total_queued = len(st.session_state.file_queue)
-        st.write(f"**Queue Status:** {total_processed} processed, {total_queued} remaining")
+        total_queued = len(st.session_state.file_queue) + total_processed
+        if total_queued > 0:
+            st.write(f"**Files:** {total_processed} processed, {len(st.session_state.file_queue)} remaining")
 
     # Process files if job is running
     if (st.session_state.job_status == 'running' and len(st.session_state.file_queue) > 0):
@@ -1701,32 +2319,35 @@ def main():
             st.session_state.job_status = 'stopped'
             return
 
-        # Process the file queue (handles both uploaded files and discovered files)
-        current_file_info = st.session_state.file_queue[0]  # Peek at next file
+        current_file_info = st.session_state.file_queue[0]
         
         # Check if this is an uploaded file (has file_object) or a discovered file (has path)
         if 'file_object' in current_file_info and current_file_info['file_object'] is not None:
-            # Handle uploaded file (Single or Multiple Files option)
-            uploaded_file = current_file_info['file_object']
-            file_extension = current_file_info['extension']
+            # Handle uploaded file
+            uploaded_file = st.session_state.file_queue.pop(0)
+            file_extension = uploaded_file['extension']
             temp_file_path = None
 
             try:
                 # Create a unique temporary file
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp:
-                    tmp.write(uploaded_file.getbuffer())
+                    tmp.write(uploaded_file['file_object'].getbuffer())
                     temp_file_path = tmp.name
 
-                file_size = current_file_info['size'] / 1024 / 1024
-                st.write(f"📁 **File:** {current_file_info['name']} ({file_size:.2f} MB)")
+                file_size = uploaded_file['size'] / 1024 / 1024
+                st.write(f"📁 **File:** {uploaded_file['name']} ({file_size:.2f} MB)")
 
                 model_category = classify_model(config['model'])
                 category_desc = MODEL_CATEGORIES.get(model_category, {}).get("description", "Unknown")
                 st.write(f"🎯 **Using LLM:** {config['model']} ({category_desc})")
                 st.write(f"🌍 **Using Embeddings:** {config['embedding_model']}")
+                
+                # Show GPU info if available
+                if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+                    st.write(f"⚡ **GPU Optimized:** Batch size = {st.session_state.optimal_batch_size} documents")
 
-                # Process the temporary file
-                process_single_file(temp_file_path, file_extension, llm, config, ollama_url, analysis_prompt)
+                # Process the temporary file with streaming optimization
+                process_single_file_streaming(temp_file_path, file_extension, llm, config, ollama_url, analysis_prompt)
 
             finally:
                 # Clean up the temp file
@@ -1734,23 +2355,407 @@ def main():
                     os.remove(temp_file_path)
 
         else:
-            # Handle discovered file from folder selection (has path)
+            # Handle discovered file from folder selection
             process_file_queue(llm, config, ollama_url, analysis_prompt)
 
-    # Display previous report
-    elif st.session_state.current_report and st.session_state.job_status in ['completed', 'stopped']:
-        st.subheader("📊 DFIR Analysis Report")
-        st.text_area("Detailed Security Assessment", st.session_state.current_report, height=500, key="previous_report")
+    # --- UPDATED: Enhanced Report Display Logic ---
+    elif st.session_state.job_status == 'completed' and st.session_state.processed_files:
+        
+        # Create tabs for different report views
+        tab1, tab2, tab3 = st.tabs(["📊 Executive Summary", "📋 Detailed Reports", "📈 Statistics"])
+        
+        with tab1:
+            # 1. Check if the final executive summary has run (only for bulk analysis)
+            is_bulk_analysis = len(st.session_state.processed_files) > 1 or (len(st.session_state.processed_files) == 1 and st.session_state.file_queue)
+            
+            if is_bulk_analysis and not st.session_state.final_summary_generated:
+                st.subheader("Finalizing Analysis...")
+                
+                # Get LLM connection info
+                connection_info = st.session_state.connection_info
+                llm = connection_info["llm"]
+                
+                # Pass the structured data to the final consolidation function
+                final_summary = generate_executive_summary(st.session_state.processed_files, llm)
+                
+                # Update session state with the final result
+                st.session_state.current_report = final_summary
+                st.session_state.final_summary_generated = True
+                
+                # Rerun to display the final summary
+                st.rerun() 
+                
+            # 2. Display the Executive Summary
+            if st.session_state.current_report:
+                if st.session_state.final_summary_generated:
+                    st.subheader("📊 FINAL DFIR EXECUTIVE SUMMARY")
+                    st.markdown("**Report Status:** ✅ All file analysis completed and findings consolidated.")
+                elif len(st.session_state.processed_files) == 1: # Single file result, report already generated
+                    st.subheader(f"📊 DFIR Analysis Report for {st.session_state.processed_files[0]['path']}")
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"dfir_report_{timestamp}.txt"
-        st.download_button(
-            label="📥 Download Report",
-            data=st.session_state.current_report,
-            file_name=filename,
-            mime="text/plain",
-            key="download_previous"
-        )
+                st.text_area("Detailed Security Assessment", st.session_state.current_report, height=500, key="executive_report")
+
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                exec_filename = f"dfir_executive_summary_{timestamp}.txt"
+                st.download_button(
+                    label="📥 Download Executive Summary",
+                    data=st.session_state.current_report,
+                    file_name=exec_filename,
+                    mime="text/plain",
+                    key="download_executive"
+                )
+            else:
+                st.info("No executive summary generated. Processing may have completed without generating a consolidated report.")
+        
+        with tab2:
+            st.subheader("📋 DETAILED FILE REPORTS")
+            
+            # Filter for successful analyses
+            successful_reports = [f for f in st.session_state.processed_files if f.get('status') == 'success']
+            skipped_reports = [f for f in st.session_state.processed_files if f.get('status') == 'skipped']
+            error_reports = [f for f in st.session_state.processed_files if f.get('status') == 'error']
+            
+            # Show statistics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Successful", len(successful_reports), delta=None)
+            with col2:
+                st.metric("Skipped", len(skipped_reports), delta=None)
+            with col3:
+                st.metric("Errors", len(error_reports), delta=None)
+            
+            # Create expandable sections for each file
+            for i, file_result in enumerate(st.session_state.processed_files):
+                file_status = file_result.get('status', 'unknown')
+                file_name = file_result.get('name', file_result.get('path', f"File {i+1}"))
+                file_size_mb = file_result.get('size', 0) / (1024 * 1024)
+                
+                # Color code based on status
+                if file_status == 'success':
+                    status_emoji = "✅"
+                    status_color = "green"
+                elif file_status == 'skipped':
+                    status_emoji = "⏭️"
+                    status_color = "orange"
+                elif file_status == 'error':
+                    status_emoji = "❌"
+                    status_color = "red"
+                else:
+                    status_emoji = "❓"
+                    status_color = "gray"
+                
+                # Create expander for each file
+                with st.expander(f"{status_emoji} {file_name} ({file_size_mb:.2f} MB) - {file_status.upper()}", expanded=(i==0)):
+                    
+                    # File metadata
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.write(f"**Path:** {file_result.get('path', 'N/A')}")
+                    with col2:
+                        st.write(f"**Size:** {file_size_mb:.2f} MB")
+                    with col3:
+                        st.write(f"**Status:** {file_status}")
+                    
+                    # Additional metadata if available
+                    if 'rows_ingested' in file_result:
+                        st.write(f"**Rows Processed:** {file_result['rows_ingested']:,}")
+                    if 'chunks_processed' in file_result:
+                        st.write(f"**Chunks Created:** {file_result['chunks_processed']}")
+                    if 'analysis_timestamp' in file_result:
+                        st.write(f"**Analyzed:** {file_result['analysis_timestamp']}")
+                    
+                    # Display the report content
+                    if file_status == 'success' and file_result.get('report'):
+                        st.write("---")
+                        st.subheader("Analysis Report")
+                        st.text_area(
+                            f"Detailed Analysis for {file_name}",
+                            file_result['report'],
+                            height=300,
+                            key=f"detailed_report_{i}"
+                        )
+                        
+                        # Individual file download button
+                        safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '-', '_')).rstrip()
+                        detailed_filename = f"dfir_detailed_{safe_filename}_{timestamp if 'timestamp' in locals() else datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                        
+                        st.download_button(
+                            label=f"📥 Download {file_name} Report",
+                            data=file_result['report'],
+                            file_name=detailed_filename,
+                            mime="text/plain",
+                            key=f"download_detailed_{i}"
+                        )
+                    
+                    elif file_status == 'error' and 'error_message' in file_result:
+                        st.error(f"**Error:** {file_result['error_message']}")
+                    
+                    elif file_status == 'skipped':
+                        st.info(f"**Reason:** {file_result.get('report', 'File was skipped during processing')}")
+            
+            # Combined detailed reports download
+            if successful_reports:
+                st.write("---")
+                st.subheader("📦 Combined Detailed Reports")
+                
+                # Create combined report
+                combined_detailed = "=" * 80 + "\n"
+                combined_detailed += "FORENSIQ - DETAILED FILE ANALYSIS REPORTS\n"
+                combined_detailed += f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                combined_detailed += f"Total Files: {len(st.session_state.processed_files)}\n"
+                combined_detailed += f"Successful Analyses: {len(successful_reports)}\n"
+                combined_detailed += f"Skipped Files: {len(skipped_reports)}\n"
+                combined_detailed += f"Errors: {len(error_reports)}\n"
+                combined_detailed += "=" * 80 + "\n\n"
+                
+                for i, file_result in enumerate(successful_reports):
+                    combined_detailed += f"\n{'='*60}\n"
+                    combined_detailed += f"FILE {i+1}: {file_result.get('path', 'Unknown')}\n"
+                    combined_detailed += f"{'='*60}\n\n"
+                    combined_detailed += file_result['report']
+                    combined_detailed += "\n\n"
+                
+                st.text_area("Combined Detailed Reports", combined_detailed, height=400, key="combined_detailed")
+                
+                combined_filename = f"dfir_all_detailed_reports_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                st.download_button(
+                    label="📥 Download All Detailed Reports",
+                    data=combined_detailed,
+                    file_name=combined_filename,
+                    mime="text/plain",
+                    key="download_all_detailed"
+                )
+        
+        with tab3:
+            st.subheader("📈 PROCESSING STATISTICS")
+            
+            # Calculate statistics
+            total_files = len(st.session_state.processed_files)
+            successful = len([f for f in st.session_state.processed_files if f.get('status') == 'success'])
+            skipped = len([f for f in st.session_state.processed_files if f.get('status') == 'skipped'])
+            errors = len([f for f in st.session_state.processed_files if f.get('status') == 'error'])
+            
+            # File sizes
+            total_size_mb = sum(f.get('size', 0) for f in st.session_state.processed_files) / (1024 * 1024)
+            avg_size_mb = total_size_mb / total_files if total_files > 0 else 0
+            
+            # Rows processed
+            total_rows = sum(f.get('rows_ingested', 0) for f in st.session_state.processed_files)
+            total_chunks = sum(f.get('chunks_processed', 0) for f in st.session_state.processed_files)
+            
+            # Display metrics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Files", total_files)
+                st.metric("Successful", successful, delta=f"{(successful/total_files*100 if total_files>0 else 0):.1f}%")
+            with col2:
+                st.metric("Total Size", f"{total_size_mb:.1f} MB")
+                st.metric("Avg File Size", f"{avg_size_mb:.1f} MB")
+            with col3:
+                st.metric("Total Rows", f"{total_rows:,}")
+                st.metric("Total Chunks", total_chunks)
+            
+            # Success rate chart
+            st.write("---")
+            st.subheader("Success Rate")
+            
+            if total_files > 0:
+                import plotly.graph_objects as go
+                
+                labels = ['Successful', 'Skipped', 'Errors']
+                values = [successful, skipped, errors]
+                colors = ['#00cc96', '#ffa15a', '#ef553b']
+                
+                fig = go.Figure(data=[go.Pie(
+                    labels=labels, 
+                    values=values,
+                    hole=.3,
+                    marker=dict(colors=colors)
+                )])
+                
+                fig.update_layout(
+                    title="File Processing Results",
+                    height=400
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # File size distribution
+            st.write("---")
+            st.subheader("File Size Distribution")
+            
+            if successful_reports:
+                file_sizes = [f.get('size', 0) / (1024 * 1024) for f in successful_reports]
+                file_names = [f.get('name', f"File {i+1}") for i, f in enumerate(successful_reports)]
+                
+                # Create bar chart
+                import plotly.graph_objects as go
+                
+                fig = go.Figure(data=[
+                    go.Bar(
+                        x=file_names,
+                        y=file_sizes,
+                        text=[f"{size:.1f} MB" for size in file_sizes],
+                        textposition='auto',
+                        marker_color='#636efa'
+                    )
+                ])
+                
+                fig.update_layout(
+                    title="File Sizes (Successful Analyses)",
+                    xaxis_title="File Name",
+                    yaxis_title="Size (MB)",
+                    height=400,
+                    xaxis_tickangle=-45
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Processing timeline
+            st.write("---")
+            st.subheader("Processing Timeline")
+            
+            if 'analysis_timestamp' in st.session_state.processed_files[0]:
+                timeline_data = []
+                for file_result in st.session_state.processed_files:
+                    if 'analysis_timestamp' in file_result:
+                        try:
+                            timestamp = datetime.datetime.fromisoformat(file_result['analysis_timestamp'])
+                            timeline_data.append({
+                                'file': file_result.get('name', 'Unknown'),
+                                'timestamp': timestamp,
+                                'status': file_result.get('status', 'unknown'),
+                                'size_mb': file_result.get('size', 0) / (1024 * 1024)
+                            })
+                        except:
+                            continue
+                
+                if timeline_data:
+                    # Sort by timestamp
+                    timeline_data.sort(key=lambda x: x['timestamp'])
+                    
+                    # Create timeline visualization
+                    timeline_html = """
+                    <div style="margin: 20px 0; padding: 20px; background: #f5f5f5; border-radius: 10px;">
+                        <h4 style="margin-top: 0;">Processing Timeline</h4>
+                    """
+                    
+                    for item in timeline_data:
+                        status_color = {
+                            'success': '#28a745',
+                            'skipped': '#ffc107',
+                            'error': '#dc3545'
+                        }.get(item['status'], '#6c757d')
+                        
+                        time_str = item['timestamp'].strftime("%H:%M:%S")
+                        timeline_html += f"""
+                        <div style="display: flex; align-items: center; margin: 10px 0; padding: 10px; background: white; border-radius: 5px; border-left: 5px solid {status_color};">
+                            <div style="flex: 0 0 80px; font-weight: bold;">{time_str}</div>
+                            <div style="flex: 1;">{item['file']}</div>
+                            <div style="flex: 0 0 60px; text-align: right; font-weight: bold; color: {status_color};">{item['status'].upper()}</div>
+                            <div style="flex: 0 0 80px; text-align: right;">{item['size_mb']:.1f} MB</div>
+                        </div>
+                        """
+                    
+                    timeline_html += "</div>"
+                    st.markdown(timeline_html, unsafe_allow_html=True)
+            
+            # Model information
+            st.write("---")
+            st.subheader("Model Information")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.info(f"**LLM Model:** {config.get('model', 'Not specified')}")
+            with col2:
+                st.info(f"**Embedding Model:** {config.get('embedding_model', 'Not specified')}")
+            
+            if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+                st.success(f"**GPU Used:** {st.session_state.gpu_info['name']} ({st.session_state.gpu_info['vram_gb']:.1f}GB VRAM)")
+                st.info(f"**Optimal Batch Size:** {st.session_state.optimal_batch_size} documents")
+            
+            # Processing summary
+            st.write("---")
+            st.subheader("Processing Summary")
+            
+            summary_text = f"""
+            ## Processing Summary
+            
+            **Total Execution:** {total_files} files processed
+            **Success Rate:** {(successful/total_files*100 if total_files>0 else 0):.1f}%
+            **Total Data:** {total_size_mb:.1f} MB
+            **Analysis Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            
+            **Configuration:**
+            - LLM: {config.get('model', 'N/A')}
+            - Embeddings: {config.get('embedding_model', 'N/A')}
+            - Ollama: http://{config.get('ollama_host', 'N/A')}:{config.get('ollama_port', 'N/A')}
+            
+            **Performance:**
+            - Average file size: {avg_size_mb:.1f} MB
+            - Total rows processed: {total_rows:,}
+            - Total chunks generated: {total_chunks}
+            """
+            
+            st.markdown(summary_text)
+            
+            # Download statistics report
+            stats_report = f"""FORENSIQ PROCESSING STATISTICS REPORT
+Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+SUMMARY
+=======
+Total Files Processed: {total_files}
+Successful Analyses: {successful} ({(successful/total_files*100 if total_files>0 else 0):.1f}%)
+Skipped Files: {skipped}
+Errors: {errors}
+
+Total Data Size: {total_size_mb:.1f} MB
+Average File Size: {avg_size_mb:.1f} MB
+Total Rows Processed: {total_rows:,}
+Total Chunks Generated: {total_chunks}
+
+CONFIGURATION
+=============
+LLM Model: {config.get('model', 'N/A')}
+Embedding Model: {config.get('embedding_model', 'N/A')}
+Ollama URL: http://{config.get('ollama_host', 'N/A')}:{config.get('ollama_port', 'N/A')}
+
+GPU INFORMATION
+===============
+"""
+            
+            if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+                stats_report += f"""GPU: {st.session_state.gpu_info['name']}
+VRAM: {st.session_state.gpu_info['vram_gb']:.1f} GB
+Optimal Batch Size: {st.session_state.optimal_batch_size} documents
+"""
+            else:
+                stats_report += "GPU: Not available (CPU mode)\n"
+            
+            stats_report += f"""
+DETAILED FILE RESULTS
+=====================
+"""
+            
+            for i, file_result in enumerate(st.session_state.processed_files):
+                stats_report += f"""
+File {i+1}: {file_result.get('path', 'N/A')}
+  Status: {file_result.get('status', 'unknown')}
+  Size: {file_result.get('size', 0) / (1024 * 1024):.1f} MB
+  Rows: {file_result.get('rows_ingested', 'N/A')}
+  Chunks: {file_result.get('chunks_processed', 'N/A')}
+  Timestamp: {file_result.get('analysis_timestamp', 'N/A')}
+"""
+            
+            st.download_button(
+                label="📊 Download Statistics Report",
+                data=stats_report,
+                file_name=f"dfir_statistics_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                key="download_statistics"
+            )
+    # --- END UPDATED REPORT DISPLAY LOGIC ---
 
     # Footer
     st.write("---")
