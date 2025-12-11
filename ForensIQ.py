@@ -23,10 +23,18 @@ import tempfile
 import tkinter as tk
 from tkinter import filedialog
 
-print("")
-print("Developed by Jacob Wilson")
-print("dfirvault@gmail.com")
-print("")
+# --- FIX 1: Print developer info only once ---
+_developer_info_printed = False
+
+def print_developer_info():
+    """Print developer info only once per session"""
+    global _developer_info_printed
+    if not _developer_info_printed:
+        print("")
+        print("Developed by Jacob Wilson")
+        print("dfirvault@gmail.com")
+        print("")
+        _developer_info_printed = True
 
 # Enhanced EVTX import with better error handling
 PyEvtxParser = None
@@ -596,9 +604,13 @@ def monitor_gpu_utilization():
 
 # --- NEW: Incremental vector store builder with GPU optimization ---
 def build_vector_store_incrementally(chunks_generator, config, ollama_url, status_callback=None, batch_size=100):
-    """Build vector store incrementally as chunks become available with optimized batch sizes"""
+    """Build vector store incrementally with resource limits to prevent file descriptor exhaustion"""
     persist_directory = tempfile.mkdtemp()
     st.write(f"🔧 Using temporary vector store directory: {Path(persist_directory).name}")
+    
+    chroma_client = None
+    collection = None
+    embeddings = None
     
     try:
         st.write(f"🔧 Building vector store incrementally (batch size: {batch_size})...")
@@ -612,49 +624,134 @@ def build_vector_store_incrementally(chunks_generator, config, ollama_url, statu
         # Test embedding with a small sample
         _ = embeddings.embed_query("Test embedding")
         
-        # Create Chroma client
-        chroma_client = chromadb.PersistentClient(path=persist_directory)
-        
-        # Initialize collection with optimized settings for better performance
-        collection_name = "log_analysis_streaming"
-        collection = chroma_client.get_or_create_collection(
-            name=collection_name,
-            metadata={
-                "hnsw:space": "cosine",
-                "hnsw:construction_ef": 128,  # Lower for faster building
-                "hnsw:M": 16,  # Lower for faster building
-            }
+        # Create Chroma client with explicit settings
+        chroma_client = chromadb.PersistentClient(
+            path=persist_directory,
+            settings=chromadb.Settings(
+                allow_reset=True,
+                anonymized_telemetry=False,
+                is_persistent=True,
+            )
         )
+        
+        # Initialize collection with optimized settings
+        collection_name = "log_analysis_streaming"
+        try:
+            # Try to delete existing collection first
+            try:
+                chroma_client.delete_collection(collection_name)
+            except:
+                pass
+            
+            collection = chroma_client.create_collection(
+                name=collection_name,
+                metadata={
+                    "hnsw:space": "cosine",
+                    "hnsw:construction_ef": 128,
+                    "hnsw:M": 16,
+                }
+            )
+        except Exception as e:
+            st.warning(f"⚠️ Could not create collection: {e}")
+            collection = chroma_client.get_collection(collection_name)
         
         chunk_counter = 0
         total_docs = 0
         all_docs = []
         all_texts = []
         
-        # Monitor timing for optimization
+        # Monitor timing and resource usage
         import time
         start_time = time.time()
         batch_times = []
+        
+        # Set a maximum number of chunks to process to prevent resource exhaustion
+        max_chunks = 10000  # Safety limit
+        processed_chunks = 0
         
         # Process chunks as they come
         for chunk_text in chunks_generator:
             if not chunk_text:
                 continue
                 
+            # Safety check
+            processed_chunks += 1
+            if processed_chunks > max_chunks:
+                st.warning(f"⚠️ Reached safety limit of {max_chunks} chunks. Stopping to prevent resource exhaustion.")
+                break
+            
             # Add document to list for batch processing
-            doc = Document(page_content=chunk_text)
-            all_docs.append(doc)
+            all_docs.append(Document(page_content=chunk_text))
             all_texts.append(chunk_text)
             
-            # Process in larger batches to improve GPU utilization
+            # Process in batches to improve GPU utilization and manage resources
             if len(all_docs) >= batch_size:
                 batch_start = time.time()
                 
-                # Get embeddings for the entire batch at once
+                try:
+                    # Get embeddings for the entire batch at once
+                    batch_embeddings = embeddings.embed_documents(all_texts)
+                    
+                    # Add to collection in a single operation
+                    batch_ids = [f"doc_{chunk_counter}_{i}" for i in range(len(all_docs))]
+                    collection.add(
+                        documents=all_texts,
+                        embeddings=batch_embeddings,
+                        ids=batch_ids
+                    )
+                    
+                    total_docs += len(all_docs)
+                    chunk_counter += 1
+                    
+                    # Calculate batch processing time
+                    batch_time = time.time() - batch_start
+                    batch_times.append(batch_time)
+                    avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else batch_time
+                    
+                    docs_per_second = len(all_docs) / batch_time if batch_time > 0 else 0
+                    
+                    st.write(f"📚 Batch {chunk_counter}: Added {len(all_docs)} documents "
+                            f"({docs_per_second:.1f} docs/sec, avg: {avg_batch_time:.2f}s per batch) "
+                            f"[Total: {total_docs}]")
+                    
+                    # Call status callback if provided
+                    if status_callback:
+                        status_callback({
+                            'progress': min(100, int((chunk_counter * batch_size) / max(1, chunk_counter * batch_size) * 100)),
+                            'total_docs': total_docs,
+                            'batch_size': len(all_docs),
+                            'docs_per_second': docs_per_second,
+                            'status': 'building'
+                        })
+                    
+                    # Clear batch and free memory
+                    all_docs.clear()
+                    all_texts.clear()
+                    
+                    # Periodically close and reopen connection to free file descriptors
+                    if chunk_counter % 10 == 0:
+                        try:
+                            # Force garbage collection
+                            gc.collect()
+                            # Small delay to allow system to clean up
+                            time.sleep(0.1)
+                        except:
+                            pass
+                    
+                except Exception as batch_error:
+                    st.error(f"❌ Error in batch {chunk_counter}: {batch_error}")
+                    # Clear failed batch to continue
+                    all_docs.clear()
+                    all_texts.clear()
+                    continue
+        
+        # Process any remaining documents
+        if all_docs:
+            batch_start = time.time()
+            try:
                 batch_embeddings = embeddings.embed_documents(all_texts)
-                
-                # Add to collection in a single operation
                 batch_ids = [f"doc_{chunk_counter}_{i}" for i in range(len(all_docs))]
+                
                 collection.add(
                     documents=all_texts,
                     embeddings=batch_embeddings,
@@ -664,51 +761,13 @@ def build_vector_store_incrementally(chunks_generator, config, ollama_url, statu
                 total_docs += len(all_docs)
                 chunk_counter += 1
                 
-                # Calculate batch processing time
                 batch_time = time.time() - batch_start
-                batch_times.append(batch_time)
-                avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else batch_time
-                
                 docs_per_second = len(all_docs) / batch_time if batch_time > 0 else 0
                 
-                st.write(f"📚 Batch {chunk_counter}: Added {len(all_docs)} documents "
-                        f"({docs_per_second:.1f} docs/sec, avg: {avg_batch_time:.2f}s per batch) "
-                        f"[Total: {total_docs}]")
-                
-                # Call status callback if provided
-                if status_callback:
-                    status_callback({
-                        'progress': min(100, int((chunk_counter * batch_size) / max(1, chunk_counter * batch_size) * 100)),
-                        'total_docs': total_docs,
-                        'batch_size': len(all_docs),
-                        'docs_per_second': docs_per_second,
-                        'status': 'building'
-                    })
-                
-                # Clear batch
-                all_docs = []
-                all_texts = []
-        
-        # Process any remaining documents
-        if all_docs:
-            batch_start = time.time()
-            batch_embeddings = embeddings.embed_documents(all_texts)
-            batch_ids = [f"doc_{chunk_counter}_{i}" for i in range(len(all_docs))]
-            
-            collection.add(
-                documents=all_texts,
-                embeddings=batch_embeddings,
-                ids=batch_ids
-            )
-            
-            total_docs += len(all_docs)
-            chunk_counter += 1
-            
-            batch_time = time.time() - batch_start
-            docs_per_second = len(all_docs) / batch_time if batch_time > 0 else 0
-            
-            st.write(f"📚 Final batch: Added {len(all_docs)} documents "
-                    f"({docs_per_second:.1f} docs/sec) [Total: {total_docs}]")
+                st.write(f"📚 Final batch: Added {len(all_docs)} documents "
+                        f"({docs_per_second:.1f} docs/sec) [Total: {total_docs}]")
+            except Exception as final_batch_error:
+                st.error(f"❌ Error in final batch: {final_batch_error}")
         
         total_time = time.time() - start_time
         overall_docs_per_second = total_docs / total_time if total_time > 0 else 0
@@ -744,12 +803,128 @@ def build_vector_store_incrementally(chunks_generator, config, ollama_url, statu
         
     except Exception as e:
         st.error(f"❌ Error building incremental vector store: {str(e)}")
+        
+        # Clean up resources
+        try:
+            if collection:
+                collection = None
+            if chroma_client:
+                chroma_client = None
+            if embeddings:
+                embeddings = None
+        except:
+            pass
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clean up directory
         if os.path.exists(persist_directory):
             try:
-                shutil.rmtree(persist_directory)
+                # Wait before cleanup
+                time.sleep(1)
+                shutil.rmtree(persist_directory, ignore_errors=True)
             except:
                 pass
+        
         return {'status': 'error', 'error': str(e)}
+
+# --- FIX 2: Enhanced cleanup function for ChromaDB files ---
+def safe_chromadb_cleanup(vectorstore, persist_dir):
+    """Safely cleanup ChromaDB resources and files"""
+    try:
+        # First try to properly close the vectorstore
+        if vectorstore:
+            try:
+                # Try to close client connection if it exists
+                if hasattr(vectorstore, '_client') and vectorstore._client:
+                    try:
+                        vectorstore._client.heartbeat()  # Test connection
+                    except:
+                        pass
+                    vectorstore._client = None
+                
+                # Clear collection reference
+                if hasattr(vectorstore, '_collection'):
+                    vectorstore._collection = None
+                
+                # Clear embedding function
+                if hasattr(vectorstore, '_embedding_function'):
+                    vectorstore._embedding_function = None
+                    
+            except Exception as e:
+                st.warning(f"⚠️ Could not properly close vectorstore: {e}")
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Small delay to allow system to release resources
+        time.sleep(0.5)
+        
+        # Now try to delete the directory
+        if persist_dir and os.path.exists(persist_dir):
+            # Function to force remove directory
+            def remove_readonly(func, path, _):
+                """Remove readonly attribute on Windows"""
+                try:
+                    os.chmod(path, 0o666)  # Make writable
+                    func(path)
+                except:
+                    pass
+            
+            # Multiple attempts to delete
+            for attempt in range(3):
+                try:
+                    shutil.rmtree(persist_dir, onerror=remove_readonly, ignore_errors=True)
+                    if not os.path.exists(persist_dir):
+                        return True
+                    else:
+                        time.sleep(0.5)  # Wait and retry
+                except Exception as e:
+                    if attempt == 2:
+                        st.warning(f"⚠️ Could not delete directory after 3 attempts: {e}")
+                    time.sleep(0.5)
+        
+        return True
+        
+    except Exception as e:
+        st.warning(f"⚠️ Error during cleanup: {e}")
+        return False
+
+def increase_file_descriptor_limit():
+    """Try to increase the file descriptor limit for the current process"""
+    try:
+        import resource
+        # Get current limits
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        st.write(f"📁 Current file descriptor limits: Soft={soft}, Hard={hard}")
+        
+        # Try to increase the soft limit
+        if hard > soft:
+            try:
+                # Try to increase to the hard limit
+                new_soft = min(hard, 10000)  # Don't exceed hard limit, max 10000
+                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+                st.success(f"✅ Increased file descriptor limit to: Soft={new_soft}, Hard={hard}")
+                return True
+            except (ValueError, resource.error) as e:
+                st.warning(f"⚠️ Could not increase file descriptor limit: {e}")
+        
+        # Check if current limit is reasonable
+        if soft < 2048:
+            st.warning(f"⚠️ Low file descriptor limit ({soft}). May encounter 'Too many open files' errors.")
+            st.info("💡 To permanently increase limit, run: `ulimit -n 10000`")
+            return False
+        
+        return True
+        
+    except ImportError:
+        # resource module not available on Windows
+        st.info("ℹ️ File descriptor limits not adjustable on this system")
+        return True
+    except Exception as e:
+        st.warning(f"⚠️ Could not check file descriptor limits: {e}")
+        return True
 
 def get_available_models(ollama_url):
     """Get available models from Ollama API"""
@@ -1249,11 +1424,13 @@ def chunk_logs(df, use_streaming=True):
         st.error(f"❌ Error chunking logs: {str(e)}")
         return []
 
-# --- UPDATED: build_vector_store with streaming support ---
+# --- UPDATED: build_vector_store with better cleanup integration ---
 def build_vector_store(chunks, config, ollama_url, use_streaming=True):
-    """Build vector store, optionally using streaming with optimized batch sizes"""
+    """Build vector store with better file descriptor management"""
     persist_directory = tempfile.mkdtemp()
     st.write(f"🔧 Using temporary vector store directory: {Path(persist_directory).name}")
+    
+    vectorstore = None
     
     try:
         st.write("🔧 Building vector store...")
@@ -1290,39 +1467,49 @@ def build_vector_store(chunks, config, ollama_url, use_streaming=True):
                 model=config['embedding_model'],
                 base_url=ollama_url
             )
-            _ = embeddings.embed_query("Test embedding")
+            
+            # Test embedding with timeout
+            try:
+                _ = embeddings.embed_query("Test embedding")
+            except Exception as e:
+                st.error(f"❌ Error testing embeddings: {e}")
+                raise
             
             docs = [Document(page_content=chunk) for chunk in chunks]
             st.write(f"📚 Creating embeddings for {len(docs)} documents...")
             
-            # For non-streaming, use larger batch size if we have GPU
-            if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
-                # Process in larger batches even for non-streaming
-                vectorstore = Chroma.from_documents(
-                    docs,
-                    embeddings,
-                    collection_name="log_analysis",
-                    persist_directory=persist_directory,
-                    collection_metadata={"hnsw:batch_size": "100"}  # Suggest larger batches
-                )
-            else:
-                vectorstore = Chroma.from_documents(
-                    docs,
-                    embeddings,
-                    collection_name="log_analysis",
-                    persist_directory=persist_directory
-                )
-            
-            st.write("✅ Vector store created successfully!")
-            return vectorstore, persist_directory
+            try:
+                # For non-streaming, use larger batch size if we have GPU
+                if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+                    # Process in larger batches even for non-streaming
+                    vectorstore = Chroma.from_documents(
+                        docs,
+                        embeddings,
+                        collection_name="log_analysis",
+                        persist_directory=persist_directory,
+                        collection_metadata={"hnsw:batch_size": "100"}  # Suggest larger batches
+                    )
+                else:
+                    vectorstore = Chroma.from_documents(
+                        docs,
+                        embeddings,
+                        collection_name="log_analysis",
+                        persist_directory=persist_directory
+                    )
+                
+                st.write("✅ Vector store created successfully!")
+                return vectorstore, persist_directory
+                
+            except Exception as e:
+                st.error(f"❌ Error creating ChromaDB from documents: {str(e)}")
+                raise
             
     except Exception as e:
         st.error(f"❌ Error initializing ChromaDB vector store: {str(e)}")
-        if os.path.exists(persist_directory):
-            try:
-                shutil.rmtree(persist_directory)
-            except:
-                pass
+        
+        # Use enhanced cleanup
+        safe_chromadb_cleanup(vectorstore, persist_directory)
+        
         return None, None
 
 # --- NEW, FASTER "MAP REDUCE" VERSION ---
@@ -1450,9 +1637,13 @@ def generate_executive_summary(processed_files_data, llm):
         return str(result.content)
     return str(result) if result else "Consolidation failed or returned no data."
 
-# --- UPDATED: process_file_queue function with enhanced storage ---
+# --- UPDATED: process_file_queue function with enhanced cleanup ---
 def process_file_queue(llm, config, ollama_url, analysis_prompt):
-    """Process multiple files from the queue with enhanced storage"""
+    """Process multiple files from the queue with enhanced resource management"""
+    # Check and increase file descriptor limits at start
+    if st.session_state.job_status == 'running' and len(st.session_state.file_queue) > 0:
+        increase_file_descriptor_limit()
+    
     if not st.session_state.file_queue:
         st.session_state.job_status = 'completed'
         st.success("🎉 File processing pipeline finished. Generating reports...")
@@ -1490,6 +1681,9 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
         with st.status(f"🚀 Processing {current_file_info['name']}...", expanded=True) as status:
             status.write("📥 **Step 1:** Ingesting log file...")
             
+            # Force garbage collection before starting
+            gc.collect()
+            
             # Determine if we should use streaming based on file size
             file_size_mb = current_file_info['size'] / (1024 * 1024)
             use_streaming = file_size_mb > 10
@@ -1522,6 +1716,13 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
                     status.write("🔧 **Step 3:** Building semantic search index...")
                     # Use streaming vector store for large chunk counts
                     use_vector_streaming = len(chunks) > 50
+                    
+                    # Limit chunk count for very large files
+                    if len(chunks) > 10000:
+                        st.warning(f"⚠️ Large number of chunks ({len(chunks)}). Limiting to first 10,000 for stability.")
+                        chunks = chunks[:10000]
+                        file_result['chunks_processed'] = len(chunks)
+                    
                     vectorstore, persist_dir = build_vector_store(chunks, config, ollama_url, use_streaming=use_vector_streaming)
 
                     if st.session_state.job_status != 'running':
@@ -1548,18 +1749,10 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
                             file_result['status'] = 'success'
                             file_result['analysis_complete'] = True
                         
-                        # Clean up vector store
-                        try:
-                            status.write("🧹 Releasing vector store file lock...")
-                            if vectorstore:
-                                vectorstore._collection = None
-                            del vectorstore
-                            vectorstore = None
-                            gc.collect()
-                            time.sleep(0.1)
-                            status.write("✅ File lock released")
-                        except Exception as close_e:
-                            status.warning(f"⚠️ Could not explicitly close vector store: {close_e}")
+                        # Enhanced cleanup of vector store
+                        status.write("🧹 Releasing vector store resources...")
+                        safe_chromadb_cleanup(vectorstore, persist_dir)
+                        status.write("✅ Resources released")
 
                     status.write("✅ File processing completed!")
 
@@ -1574,18 +1767,16 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
         file_result['report'] = f"Processing failed due to error: {str(e)}"
         file_result['status'] = 'error'
         file_result['error_message'] = str(e)
+        
+        # Force cleanup on error
+        safe_chromadb_cleanup(vectorstore, persist_dir)
 
     finally:
         # Add the enhanced result to the processed list
         st.session_state.processed_files.append(file_result)
         
-        # Ensure temporary directory is always cleaned up
-        if persist_dir and os.path.exists(persist_dir):
-            try:
-                shutil.rmtree(persist_dir)
-                st.info(f"🧹 Temporary vector store directory deleted.")
-            except Exception as del_e:
-                st.warning(f"⚠️ Could not delete directory: {del_e}")
+        # Force garbage collection between files
+        gc.collect()
 
         # Continue with next file or complete
         if st.session_state.job_status == 'running':
@@ -1597,6 +1788,32 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
         elif st.session_state.job_status == 'stopped':
             st.warning("Analysis stopped by user during file processing.")
             st.rerun()
+
+def monitor_system_resources():
+    """Monitor system resources to prevent exhaustion"""
+    try:
+        import psutil
+        
+        # Get system info
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        # Get open files for current process
+        current_process = psutil.Process()
+        open_files = len(current_process.open_files())
+        
+        return {
+            'cpu_percent': cpu_percent,
+            'memory_percent': memory.percent,
+            'memory_available_gb': memory.available / (1024**3),
+            'disk_free_gb': disk.free / (1024**3),
+            'open_files': open_files,
+            'threads': current_process.num_threads(),
+        }
+        
+    except Exception as e:
+        return None
 
 # --- NEW: Streaming file processing function with GPU optimization ---
 def process_single_file_streaming(file_path, file_extension, llm, config, ollama_url, analysis_prompt):
@@ -1727,17 +1944,9 @@ def process_single_file_streaming(file_path, file_extension, llm, config, ollama
         # Cleanup
         if persist_dir and os.path.exists(persist_dir):
             try:
-                # Close vector store first
-                if vectorstore:
-                    try:
-                        vectorstore._client.heartbeat()
-                        vectorstore._collection = None
-                    except:
-                        pass
-                
-                # Delete directory
-                shutil.rmtree(persist_dir)
-                st.info(f"🧹 Temporary vector store directory deleted.")
+                # Use enhanced cleanup
+                safe_chromadb_cleanup(vectorstore, persist_dir)
+                st.info(f"🧹 Temporary vector store directory cleaned up.")
             except Exception as del_e:
                 st.warning(f"⚠️ Could not delete directory: {del_e}")
         
@@ -1745,13 +1954,17 @@ def process_single_file_streaming(file_path, file_extension, llm, config, ollama
             st.rerun()
 
 def main():
-    # Set page config
+    # --- FIX 1: Call print_developer_info only once ---
+    print_developer_info()
+    
+    # Set page config. This MUST be the first Streamlit command.
     st.set_page_config(
         page_title="ForensIQ",
         page_icon="🧠",
         layout="wide"
     )
 
+    # Updated title and subtitle
     st.title("🧠 ForensIQ")
     st.write("AI-powered log analysis, brought to you by **[DFIR Vault](https://dfirvault.com)**.")
 
@@ -1791,6 +2004,13 @@ def main():
             'csv_mb': 10,
             'chunk_rows': 10000,
             'vector_chunks': 50
+        }
+    # --- END NEW ---
+    # --- NEW: State for processing limits ---
+    if 'processing_limits' not in st.session_state:
+        st.session_state.processing_limits = {
+            'max_concurrent_files': 5,
+            'max_chunks_per_file': 10000
         }
     # --- END NEW ---
 
@@ -1912,6 +2132,34 @@ def main():
                 'chunk_rows': chunk_threshold,
                 'vector_chunks': vector_threshold
             }
+            
+            # Processing limits
+            st.write("**🛡️ Processing Limits:**")
+            col1, col2 = st.columns(2)
+            with col1:
+                max_concurrent_files = st.number_input(
+                    "Max Files in Memory",
+                    min_value=1,
+                    max_value=50,
+                    value=5,
+                    help="Maximum number of files to keep in memory at once"
+                )
+            with col2:
+                max_chunks_per_file = st.number_input(
+                    "Max Chunks per File",
+                    min_value=100,
+                    max_value=50000,
+                    value=10000,
+                    step=1000,
+                    help="Maximum number of chunks to process per file (prevents resource exhaustion)"
+                )
+            
+            st.session_state.processing_limits = {
+                'max_concurrent_files': max_concurrent_files,
+                'max_chunks_per_file': max_chunks_per_file
+            }
+            
+            st.info("💡 **Note:** These limits help prevent 'Too many open files' errors and system resource exhaustion.")
         
         # Refresh models button
         col1, col2 = st.columns([3, 1])
@@ -2300,6 +2548,39 @@ def main():
         if total_queued > 0:
             st.write(f"**Files:** {total_processed} processed, {len(st.session_state.file_queue)} remaining")
 
+    # --- System Resource Monitoring ---
+    if st.session_state.job_status == 'running':
+        resources = monitor_system_resources()
+        if resources:
+            with st.expander("📊 System Resources", expanded=False):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("CPU", f"{resources['cpu_percent']:.1f}%")
+                    st.metric("Memory", f"{resources['memory_percent']:.1f}%")
+                with col2:
+                    st.metric("Available RAM", f"{resources['memory_available_gb']:.1f} GB")
+                    st.metric("Disk Free", f"{resources['disk_free_gb']:.1f} GB")
+                with col3:
+                    st.metric("Open Files", resources['open_files'])
+                    st.metric("Threads", resources['threads'])
+                    
+                # Warning if resources are low
+                if resources['open_files'] > 1000:
+                    st.warning("⚠️ High number of open files. Consider reducing batch size or processing fewer files at once.")
+                if resources['memory_percent'] > 90:
+                    st.error("🚨 High memory usage! Processing may fail.")
+                if resources['memory_available_gb'] < 1:
+                    st.error("🚨 Low available memory! Consider stopping processing.")
+                
+                # Show processing limits
+                st.write("---")
+                st.write("**Current Processing Limits:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"**Max Files in Memory:** {st.session_state.processing_limits['max_concurrent_files']}")
+                with col2:
+                    st.write(f"**Max Chunks per File:** {st.session_state.processing_limits['max_chunks_per_file']:,}")
+
     # Process files if job is running
     if (st.session_state.job_status == 'running' and len(st.session_state.file_queue) > 0):
 
@@ -2318,6 +2599,10 @@ def main():
             st.error("❌ LLM connection not available. Please refresh configuration.")
             st.session_state.job_status = 'stopped'
             return
+
+        # Apply file descriptor limit increase at start of processing
+        if len(st.session_state.file_queue) > 0:
+            increase_file_descriptor_limit()
 
         current_file_info = st.session_state.file_queue[0]
         
@@ -2345,6 +2630,9 @@ def main():
                 # Show GPU info if available
                 if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
                     st.write(f"⚡ **GPU Optimized:** Batch size = {st.session_state.optimal_batch_size} documents")
+                
+                # Show processing limits
+                st.write(f"🛡️ **Processing Limits:** Max chunks = {st.session_state.processing_limits['max_chunks_per_file']:,}")
 
                 # Process the temporary file with streaming optimization
                 process_single_file_streaming(temp_file_path, file_extension, llm, config, ollama_url, analysis_prompt)
@@ -2352,7 +2640,10 @@ def main():
             finally:
                 # Clean up the temp file
                 if temp_file_path and os.path.exists(temp_file_path):
-                    os.remove(temp_file_path)
+                    try:
+                        os.remove(temp_file_path)
+                    except Exception as e:
+                        st.warning(f"⚠️ Could not delete temp file: {e}")
 
         else:
             # Handle discovered file from folder selection
