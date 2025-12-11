@@ -23,6 +23,12 @@ import tempfile
 import tkinter as tk
 from tkinter import filedialog
 
+# Add new imports for dashboard
+import threading
+from collections import deque
+import plotly.graph_objects as go
+import plotly.express as px
+
 # --- FIX 1: Print developer info only once ---
 _developer_info_printed = False
 
@@ -105,7 +111,6 @@ Context (Summaries from Log Chunks): {context}
 Question: {question}
 """
 # --- END UPDATE ---
-
 
 # Model classification definitions
 MODEL_CATEGORIES = {
@@ -1570,79 +1575,333 @@ def analyze_logs(vectorstore, llm, user_prompt_template):
         st.error(f"❌ Error during analysis: {str(e)}")
         return f"Analysis failed for this file: {str(e)}"
 
-# --- NEW FUNCTION: Executive Summary Pass (Second Reduce) ---
+# --- NEW FUNCTION: Create concatenated reports ---
+def create_concatenated_reports():
+    """Create a concatenated view of all detailed reports"""
+    if not st.session_state.processed_files:
+        return ""
+    
+    concatenated = "=" * 80 + "\n"
+    concatenated += "FORENSIQ - CONSOLIDATED DETAILED REPORTS\n"
+    concatenated += f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    concatenated += f"Total Files Analyzed: {len(st.session_state.processed_files)}\n"
+    concatenated += "=" * 80 + "\n\n"
+    
+    successful_reports = [f for f in st.session_state.processed_files if f.get('status') == 'success']
+    
+    for i, file_result in enumerate(successful_reports):
+        concatenated += f"\n{'='*60}\n"
+        concatenated += f"FILE {i+1}: {file_result.get('path', file_result.get('name', 'Unknown'))}\n"
+        concatenated += f"Size: {file_result.get('size', 0) / (1024 * 1024):.2f} MB | "
+        concatenated += f"Chunks: {file_result.get('chunks_processed', 'N/A')} | "
+        concatenated += f"Rows: {file_result.get('rows_ingested', 'N/A')}\n"
+        concatenated += f"{'='*60}\n\n"
+        
+        if file_result.get('report'):
+            concatenated += file_result['report']
+        else:
+            concatenated += "No detailed report available for this file.\n"
+        
+        concatenated += "\n\n"
+    
+    return concatenated
+
+# --- UPDATED FUNCTION: Enhanced Executive Summary Pass (Second Reduce) ---
 def generate_executive_summary(processed_files_data, llm):
     """
-    Takes a list of individual file reports and generates a final executive summary
+    Takes concatenated detailed reports and generates a final executive summary
     with actionable intelligence linked to the source file.
     """
     st.info("📈 **Finalizing Report:** Consolidating individual analysis...")
-
-    # 1. Compile all reports into one context string
-    full_analysis_context = ""
-    success_count = 0
-    for item in processed_files_data:
-        if item.get('status') == 'success' and item.get('report'):
-            file_path = item['path']
-            report_content = item['report']
-            
-            full_analysis_context += f"===== START OF ANALYSIS FOR FILE: {file_path} =====\n"
-            full_analysis_context += report_content
-            full_analysis_context += f"\n===== END OF ANALYSIS FOR FILE: {file_path} =====\n\n"
-            success_count += 1
-        
-    if success_count == 0:
+    
+    # 1. Create concatenated reports
+    concatenated_reports = create_concatenated_reports()
+    st.session_state.concatenated_reports = concatenated_reports
+    
+    if not concatenated_reports or "No detailed report available" in concatenated_reports:
         return "No threats or relevant security findings were identified in the successfully processed files."
-        
-    st.write(f"Synthesizing findings from {success_count} reports...")
-
-    # 2. Define the Final Reduce Prompt
+    
+    # Count successful reports
+    success_count = len([f for f in processed_files_data if f.get('status') == 'success' and f.get('report')])
+    st.write(f"Synthesizing findings from {success_count} detailed reports...")
+    
+    # 2. Enhanced Final Reduce Prompt with explicit file reference requirement
     final_reduce_prompt_template = """
-    You are a Lead DFIR Analyst. You are given a comprehensive analysis that spans multiple log files.
-    Your task is to synthesize this information into a single, high-level Executive Summary.
-
-    Critically, for every key finding or IOC, you MUST reference the specific source file name 
-    (provided in the analysis headers, e.g., 'FILE: auth.log') where that finding originated. 
-    Use the file name as a direct reference in brackets or parentheses.
-
-    Provide the final output with the following sections:
-
-    1.  **HIGH-LEVEL EXECUTIVE SUMMARY:** A paragraph summarizing the overall security posture and main threat.
-    2.  **ACTIONABLE INTELLIGENCE SUMMARY (Linked to Source):**
-        * List the top 3-5 critical security events or IOCs, ensuring all files are reviewed.
-        * Each entry MUST include the file name.
-        * Example Format:
-            - **CRITICAL:** High volume of failed SSH logins from IP 1.2.3.4 (Source: secure.log)
-            - **HIGH:** User 'JSmith' was created and immediately disabled (Source: System.evtx)
-            - **MEDIUM:** Suspicious file 'amcache.exe' found in temp directory (Source: AmCache File Entries.csv)
-    3.  **OVERALL RECOMMENDATIONS:** Concrete, immediate steps for triage and mitigation.
-
-    Context (All Individual File Reports):
+    You are a Lead DFIR Analyst with access to comprehensive detailed reports from multiple log files.
+    
+    **SOURCE DATA:** You have access to FULL, DETAILED reports from each file. Each file's report begins with "FILE X: [filename]" and contains complete analysis.
+    
+    **YOUR TASK:** Synthesize these detailed reports into a single, high-level Executive Summary that:
+    1. Provides strategic overview of the security posture
+    2. Identifies critical findings across ALL files
+    3. EXCLUSIVELY references specific source file names for EVERY finding
+    4. Creates actionable intelligence for immediate response
+    
+    **CRITICAL REQUIREMENT:** For EVERY key finding, IOC, or security event mentioned, you MUST reference the specific source file name (e.g., "FILE 1: auth.log" or "FILE 3: Security.evtx").
+    
+    **OUTPUT FORMAT:**
+    
+    # EXECUTIVE SUMMARY: DFIR THREAT ASSESSMENT
+    
+    ## OVERVIEW
+    [High-level summary of overall security posture across all analyzed files]
+    
+    ## CRITICAL FINDINGS (File-Linked)
+    [Bullet points of top findings, EACH explicitly linked to source file:
+     - **CRITICAL:** [Finding description] **(Source: FILE X: [filename])**
+     - **HIGH:** [Finding description] **(Source: FILE Y: [filename])**
+     - **MEDIUM:** [Finding description] **(Source: FILE Z: [filename])**]
+    
+    ## INDICATORS OF COMPROMISE (IOC Catalog)
+    [Organized list of IOCs with file attribution:
+    ### IP Addresses
+    - 192.168.1.100: Suspicious SSH attempts **(Source: FILE 2: secure.log)**
+    
+    ### User Accounts
+    - JSmith: Unauthorized privilege escalation **(Source: FILE 5: Security.evtx)**
+    
+    ### File Paths/Hashes
+    - /tmp/malware.exe: Unusual binary execution **(Source: FILE 3: syslog)**]
+    
+    ## TIMELINE CORRELATION
+    [Cross-file timeline analysis showing sequence of events across multiple logs]
+    
+    ## ACTIONABLE RECOMMENDATIONS
+    [Prioritized recommendations based on findings across all files]
+    
+    **Source Detailed Reports (Complete Context):**
     {context}
     """
     
     final_prompt = ChatPromptTemplate.from_template(final_reduce_prompt_template)
-
-    # 3. Run the Final Chain
+    
+    # 3. Run the Final Chain with concatenated reports
     final_chain = (
         {"context": RunnablePassthrough()}
         | final_prompt
         | llm
     )
     
-    with st.spinner("🧠 Running final Executive Summary consolidation..."):
-        result = final_chain.invoke({"context": full_analysis_context})
+    with st.spinner("🧠 Running final Executive Summary consolidation with full context..."):
+        result = final_chain.invoke({"context": concatenated_reports})
         
     if hasattr(result, 'content'):
         return str(result.content)
     return str(result) if result else "Consolidation failed or returned no data."
 
-# --- UPDATED: process_file_queue function with enhanced cleanup ---
+# --- NEW FUNCTION: Monitor resources continuously ---
+def monitor_resources_continuously():
+    """Continuously monitor system resources in a separate thread"""
+    while st.session_state.monitoring_active:
+        try:
+            import psutil
+            import time
+            
+            # Get CPU and RAM
+            cpu_percent = psutil.cpu_percent(interval=0.5)
+            memory = psutil.virtual_memory()
+            ram_percent = memory.percent
+            
+            # Get GPU stats if available
+            gpu_util = 0
+            gpu_mem = 0
+            
+            try:
+                gpu_stats = monitor_gpu_utilization()
+                if gpu_stats:
+                    gpu_util = gpu_stats.get('utilization_percent', 0)
+                    gpu_mem = gpu_stats.get('memory_allocated_gb', 0)
+            except:
+                pass
+            
+            # Add to history
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            st.session_state.resource_history['cpu'].append(cpu_percent)
+            st.session_state.resource_history['ram'].append(ram_percent)
+            st.session_state.resource_history['gpu_util'].append(gpu_util)
+            st.session_state.resource_history['gpu_mem'].append(gpu_mem)
+            st.session_state.resource_history['timestamps'].append(timestamp)
+            
+            # Sleep to avoid excessive CPU usage
+            time.sleep(1)
+            
+        except Exception as e:
+            # If monitoring fails, stop gracefully
+            st.session_state.monitoring_active = False
+            break
+
+# --- NEW FUNCTION: Display resource dashboard ---
+def display_resource_dashboard():
+    """Display real-time resource utilization dashboard"""
+    st.subheader("📊 System Resource Dashboard")
+    
+    if not st.session_state.resource_history['cpu']:
+        st.info("No resource data available yet. Start analysis to monitor resources.")
+        return
+    
+    # Create dashboard layout
+    col1, col2, col3, col4 = st.columns(4)
+    
+    # Current values
+    with col1:
+        current_cpu = st.session_state.resource_history['cpu'][-1] if st.session_state.resource_history['cpu'] else 0
+        st.metric("CPU Usage", f"{current_cpu:.1f}%")
+    
+    with col2:
+        current_ram = st.session_state.resource_history['ram'][-1] if st.session_state.resource_history['ram'] else 0
+        st.metric("RAM Usage", f"{current_ram:.1f}%")
+    
+    with col3:
+        current_gpu_util = st.session_state.resource_history['gpu_util'][-1] if st.session_state.resource_history['gpu_util'] else 0
+        st.metric("GPU Usage", f"{current_gpu_util:.1f}%")
+    
+    with col4:
+        current_gpu_mem = st.session_state.resource_history['gpu_mem'][-1] if st.session_state.resource_history['gpu_mem'] else 0
+        st.metric("GPU Memory", f"{current_gpu_mem:.1f} GB")
+    
+    # Create charts
+    if len(st.session_state.resource_history['timestamps']) > 1:
+        # Prepare data for plotting
+        timestamps = list(st.session_state.resource_history['timestamps'])
+        
+        # Create time series chart
+        fig = go.Figure()
+        
+        # Add CPU trace
+        if st.session_state.resource_history['cpu']:
+            fig.add_trace(go.Scatter(
+                x=timestamps,
+                y=list(st.session_state.resource_history['cpu']),
+                mode='lines+markers',
+                name='CPU %',
+                line=dict(color='#1f77b4', width=2)
+            ))
+        
+        # Add RAM trace
+        if st.session_state.resource_history['ram']:
+            fig.add_trace(go.Scatter(
+                x=timestamps,
+                y=list(st.session_state.resource_history['ram']),
+                mode='lines+markers',
+                name='RAM %',
+                line=dict(color='#2ca02c', width=2)
+            ))
+        
+        # Add GPU utilization trace if available
+        if any(v > 0 for v in st.session_state.resource_history['gpu_util']):
+            fig.add_trace(go.Scatter(
+                x=timestamps,
+                y=list(st.session_state.resource_history['gpu_util']),
+                mode='lines+markers',
+                name='GPU %',
+                line=dict(color='#ff7f0e', width=2)
+            ))
+        
+        fig.update_layout(
+            title='Resource Utilization Over Time',
+            xaxis_title='Time',
+            yaxis_title='Percentage',
+            hovermode='x unified',
+            height=300,
+            margin=dict(l=20, r=20, t=40, b=20)
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Create bar chart for memory usage
+        if any(v > 0 for v in st.session_state.resource_history['gpu_mem']):
+            fig2 = go.Figure()
+            
+            # Only show the last 10 points for clarity
+            recent_points = min(10, len(timestamps))
+            recent_timestamps = timestamps[-recent_points:]
+            recent_gpu_mem = list(st.session_state.resource_history['gpu_mem'])[-recent_points:]
+            
+            fig2.add_trace(go.Bar(
+                x=recent_timestamps,
+                y=recent_gpu_mem,
+                name='GPU Memory (GB)',
+                marker_color='#9467bd'
+            ))
+            
+            fig2.update_layout(
+                title='GPU Memory Usage (Recent)',
+                xaxis_title='Time',
+                yaxis_title='Memory (GB)',
+                height=250,
+                margin=dict(l=20, r=20, t=40, b=20)
+            )
+            
+            st.plotly_chart(fig2, use_container_width=True)
+    
+    # Control panel for monitoring
+    with st.expander("📈 Monitoring Controls", expanded=False):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if not st.session_state.monitoring_active:
+                if st.button("▶️ Start Monitoring", use_container_width=True):
+                    st.session_state.monitoring_active = True
+                    # Start monitoring thread
+                    thread = threading.Thread(target=monitor_resources_continuously)
+                    thread.daemon = True
+                    thread.start()
+                    st.session_state.monitoring_thread = thread
+                    st.rerun()
+            else:
+                if st.button("⏸️ Stop Monitoring", use_container_width=True):
+                    st.session_state.monitoring_active = False
+                    st.rerun()
+        
+        with col2:
+            if st.button("🗑️ Clear History", use_container_width=True):
+                st.session_state.resource_history = {
+                    'cpu': deque(maxlen=100),
+                    'ram': deque(maxlen=100),
+                    'gpu_util': deque(maxlen=100),
+                    'gpu_mem': deque(maxlen=100),
+                    'timestamps': deque(maxlen=100)
+                }
+                st.rerun()
+        
+        # Display system info
+        try:
+            import psutil
+            import platform
+            
+            st.write("---")
+            st.write("**System Information:**")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write(f"**OS:** {platform.system()} {platform.release()}")
+                st.write(f"**CPU Cores:** {psutil.cpu_count()}")
+                st.write(f"**Total RAM:** {psutil.virtual_memory().total / (1024**3):.1f} GB")
+            
+            with col2:
+                if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+                    st.write(f"**GPU:** {st.session_state.gpu_info['name']}")
+                    st.write(f"**GPU VRAM:** {st.session_state.gpu_info['vram_gb']:.1f} GB")
+                else:
+                    st.write("**GPU:** Not available")
+                    
+        except:
+            pass
+
+# --- UPDATED: process_file_queue function with enhanced cleanup and monitoring ---
 def process_file_queue(llm, config, ollama_url, analysis_prompt):
     """Process multiple files from the queue with enhanced resource management"""
     # Check and increase file descriptor limits at start
     if st.session_state.job_status == 'running' and len(st.session_state.file_queue) > 0:
         increase_file_descriptor_limit()
+    
+    # Start resource monitoring if not already active
+    if not st.session_state.monitoring_active and st.session_state.job_status == 'running':
+        st.session_state.monitoring_active = True
+        thread = threading.Thread(target=monitor_resources_continuously)
+        thread.daemon = True
+        thread.start()
+        st.session_state.monitoring_thread = thread
     
     if not st.session_state.file_queue:
         st.session_state.job_status = 'completed'
@@ -1835,6 +2094,14 @@ def process_single_file_streaming(file_path, file_extension, llm, config, ollama
         'embedding_model': config['embedding_model']
     }
     
+    # Start resource monitoring if not already active
+    if not st.session_state.monitoring_active:
+        st.session_state.monitoring_active = True
+        thread = threading.Thread(target=monitor_resources_continuously)
+        thread.daemon = True
+        thread.start()
+        st.session_state.monitoring_thread = thread
+    
     try:
         with st.status("🚀 Starting streaming pipeline...", expanded=True) as status:
             # Show GPU info if available
@@ -1968,7 +2235,7 @@ def main():
     st.title("🧠 ForensIQ")
     st.write("AI-powered log analysis, brought to you by **[DFIR Vault](https://dfirvault.com)**.")
 
-    # Initialize session state
+    # Initialize session state with new dashboard states
     if 'job_status' not in st.session_state:
         st.session_state.job_status = 'idle'
     if 'current_report' not in st.session_state:
@@ -2012,6 +2279,21 @@ def main():
             'max_concurrent_files': 5,
             'max_chunks_per_file': 10000
         }
+    # --- NEW: State for resource monitoring ---
+    if 'resource_history' not in st.session_state:
+        st.session_state.resource_history = {
+            'cpu': deque(maxlen=100),
+            'ram': deque(maxlen=100),
+            'gpu_util': deque(maxlen=100),
+            'gpu_mem': deque(maxlen=100),
+            'timestamps': deque(maxlen=100)
+        }
+    if 'monitoring_active' not in st.session_state:
+        st.session_state.monitoring_active = False
+    if 'concatenated_reports' not in st.session_state:
+        st.session_state.concatenated_reports = ""
+    if 'monitoring_thread' not in st.session_state:
+        st.session_state.monitoring_thread = None
     # --- END NEW ---
 
     config = st.session_state.config
@@ -2517,6 +2799,8 @@ def main():
                 st.session_state.selected_folders = []
                 st.session_state.selected_files = []
                 st.session_state.final_summary_generated = False
+                st.session_state.concatenated_reports = ""
+                st.session_state.monitoring_active = False
                 st.rerun()
 
     with col3:
@@ -2530,6 +2814,8 @@ def main():
                 st.session_state.job_status = 'idle'
                 st.session_state.current_report = None
                 st.session_state.final_summary_generated = False
+                st.session_state.concatenated_reports = ""
+                st.session_state.monitoring_active = False
                 st.rerun()
 
     # Display job status
@@ -2553,6 +2839,10 @@ def main():
         resources = monitor_system_resources()
         if resources:
             with st.expander("📊 System Resources", expanded=False):
+                # Display resource dashboard
+                display_resource_dashboard()
+                st.write("---")
+                
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("CPU", f"{resources['cpu_percent']:.1f}%")
@@ -2649,11 +2939,11 @@ def main():
             # Handle discovered file from folder selection
             process_file_queue(llm, config, ollama_url, analysis_prompt)
 
-    # --- UPDATED: Enhanced Report Display Logic ---
+    # --- UPDATED: Enhanced Report Display Logic with Dashboard Features ---
     elif st.session_state.job_status == 'completed' and st.session_state.processed_files:
         
         # Create tabs for different report views
-        tab1, tab2, tab3 = st.tabs(["📊 Executive Summary", "📋 Detailed Reports", "📈 Statistics"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Executive Summary", "📋 Detailed Reports", "📦 Concatenated Reports", "📈 Statistics & Dashboard"])
         
         with tab1:
             # 1. Check if the final executive summary has run (only for bulk analysis)
@@ -2783,42 +3073,49 @@ def main():
                     
                     elif file_status == 'skipped':
                         st.info(f"**Reason:** {file_result.get('report', 'File was skipped during processing')}")
-            
-            # Combined detailed reports download
-            if successful_reports:
-                st.write("---")
-                st.subheader("📦 Combined Detailed Reports")
-                
-                # Create combined report
-                combined_detailed = "=" * 80 + "\n"
-                combined_detailed += "FORENSIQ - DETAILED FILE ANALYSIS REPORTS\n"
-                combined_detailed += f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                combined_detailed += f"Total Files: {len(st.session_state.processed_files)}\n"
-                combined_detailed += f"Successful Analyses: {len(successful_reports)}\n"
-                combined_detailed += f"Skipped Files: {len(skipped_reports)}\n"
-                combined_detailed += f"Errors: {len(error_reports)}\n"
-                combined_detailed += "=" * 80 + "\n\n"
-                
-                for i, file_result in enumerate(successful_reports):
-                    combined_detailed += f"\n{'='*60}\n"
-                    combined_detailed += f"FILE {i+1}: {file_result.get('path', 'Unknown')}\n"
-                    combined_detailed += f"{'='*60}\n\n"
-                    combined_detailed += file_result['report']
-                    combined_detailed += "\n\n"
-                
-                st.text_area("Combined Detailed Reports", combined_detailed, height=400, key="combined_detailed")
-                
-                combined_filename = f"dfir_all_detailed_reports_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                st.download_button(
-                    label="📥 Download All Detailed Reports",
-                    data=combined_detailed,
-                    file_name=combined_filename,
-                    mime="text/plain",
-                    key="download_all_detailed"
-                )
         
         with tab3:
-            st.subheader("📈 PROCESSING STATISTICS")
+            st.subheader("📦 CONCATENATED DETAILED REPORTS")
+            
+            # Create concatenated reports if not already created
+            if not st.session_state.concatenated_reports:
+                st.session_state.concatenated_reports = create_concatenated_reports()
+            
+            if st.session_state.concatenated_reports:
+                st.info("This is the complete concatenated view of all detailed reports that was fed into the LLM for the executive summary generation.")
+                
+                st.text_area(
+                    "All Detailed Reports Combined (Used for Executive Summary)",
+                    st.session_state.concatenated_reports,
+                    height=600,
+                    key="concatenated_view_full"
+                )
+                
+                # Download button for concatenated reports
+                concat_filename = f"dfir_all_detailed_reports_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                st.download_button(
+                    label="📥 Download All Detailed Reports (Concatenated)",
+                    data=st.session_state.concatenated_reports,
+                    file_name=concat_filename,
+                    mime="text/plain",
+                    key="download_all_detailed_concat"
+                )
+                
+                # Show information about the executive summary generation
+                if st.session_state.final_summary_generated:
+                    st.success("✅ This concatenated report was successfully fed into the LLM to generate the comprehensive executive summary.")
+                    st.info("💡 **Note:** The executive summary in Tab 1 is based on this complete context, ensuring all file-specific findings are considered in the final analysis.")
+                else:
+                    st.warning("⚠️ This concatenated report has not yet been used to generate an executive summary. Run bulk analysis to create a final summary.")
+            else:
+                st.info("No detailed reports available to concatenate.")
+        
+        with tab4:
+            st.subheader("📈 PROCESSING STATISTICS & DASHBOARD")
+            
+            # Display resource dashboard
+            display_resource_dashboard()
+            st.write("---")
             
             # Calculate statistics
             total_files = len(st.session_state.processed_files)
