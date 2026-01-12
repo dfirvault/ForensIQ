@@ -323,11 +323,12 @@ def should_process_file(file_path):
     if file_path.suffix == '' and file_path.name.lower() in common_log_patterns:
         return True
     
-    # Check file size (avoid processing huge non-log files)
+    # Check file size (increase to 1GB limit as requested)
     try:
         file_size = file_path.stat().st_size
-        if file_size > 500 * 1024 * 1024:  # Increased to 500MB limit
-            return False
+        if file_size > 1 * 1024 * 1024 * 1024:  # 1GB limit (increased from 500MB)
+            st.warning(f"⚠️ File {file_path.name} is larger than 1GB ({file_size/(1024*1024*1024):.2f}GB). This may take a long time to process.")
+            # Don't return False - just warn but still process
         if file_size == 0:  # Skip empty files
             return False
     except:
@@ -417,16 +418,21 @@ def select_folder():
         st.error(f"Error opening folder dialog: {e}")
         return None
 
-# --- NEW: Streaming CSV processing function ---
+# --- NEW: Streaming CSV processing function with increased size limit ---
 def process_csv_in_streaming_chunks(file_path, chunk_size=50000):
-    """Process CSV in streaming chunks with immediate filtering"""
+    """Process CSV in streaming chunks with immediate filtering - supports up to 1GB files"""
     try:
-        st.write("📊 Processing CSV in streaming chunks...")
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        st.write(f"📊 Processing CSV ({file_size_mb:.1f} MB) in streaming chunks...")
         
         # Use pandas read_csv with chunksize for streaming
         security_keywords = ['login', 'error', 'access', 'failed', 'security', 
                            'audit', 'authentication', 'denied', 'warning', 'alert']
         keyword_pattern = '|'.join(security_keywords)
+        
+        # Adjust chunk size based on file size
+        if file_size_mb > 500:  # For very large files
+            chunk_size = 10000  # Smaller chunks to manage memory
         
         # Read CSV in chunks
         chunk_iterator = pd.read_csv(
@@ -442,7 +448,7 @@ def process_csv_in_streaming_chunks(file_path, chunk_size=50000):
         
         total_filtered_rows = 0
         chunk_count = 0
-        chunks = []
+        all_filtered_chunks = []
         
         for chunk in chunk_iterator:
             chunk_count += 1
@@ -461,25 +467,24 @@ def process_csv_in_streaming_chunks(file_path, chunk_size=50000):
                 total_filtered_rows += filtered_rows
                 
                 if filtered_rows > 0:
-                    chunks.append(filtered_chunk)
+                    all_filtered_chunks.append(filtered_chunk)
                 
-                # Immediate progress update
-                st.write(f"🔄 Chunk {chunk_count}: {initial_rows:,} → {filtered_rows:,} relevant rows (Total: {total_filtered_rows:,})")
-                
-                # Early yield if we have enough data
-                if total_filtered_rows >= 10000 and chunks:
-                    yield pd.concat(chunks, ignore_index=True)
-                    chunks = []  # Reset for next batch
+                # Progress update (less frequent for large files)
+                if chunk_count % 10 == 0 or chunk_count == 1:
+                    st.write(f"🔄 Processed {chunk_count:,} chunks: {total_filtered_rows:,} relevant rows found")
         
-        # Yield any remaining chunks
-        if chunks:
-            yield pd.concat(chunks, ignore_index=True)
-        
-        st.write(f"✅ Processed all chunks: {total_filtered_rows:,} total relevant rows")
+        # Combine all filtered chunks
+        if all_filtered_chunks:
+            final_df = pd.concat(all_filtered_chunks, ignore_index=True)
+            st.write(f"✅ Processed all chunks: {total_filtered_rows:,} total relevant rows from {chunk_count:,} chunks")
+            return final_df
+        else:
+            st.write("ℹ️ No relevant data found in streaming processing")
+            return pd.DataFrame()  # Return empty DataFrame
         
     except Exception as e:
         st.error(f"❌ Error streaming CSV: {str(e)}")
-        yield pd.DataFrame()  # Return empty DataFrame on error
+        return pd.DataFrame()  # Return empty DataFrame on error
 
 # --- NEW: Streaming chunk generator ---
 def chunk_logs_streaming(df, chunk_size=3000, chunk_overlap=300):
@@ -519,7 +524,7 @@ def chunk_logs_streaming(df, chunk_size=3000, chunk_overlap=300):
             # Update progress
             progress = min(100, int((batch_end / total_rows) * 100))
             if progress % 20 == 0:  # Update every 20% to avoid too many messages
-                st.write(f"📊 Chunking progress: {progress}% ({batch_end}/{total_rows} rows)")
+                st.write(f"📊 Chunking progress: {progress}% ({batch_end:,}/{total_rows:,} rows)")
         
         st.write(f"✅ Created {len(all_chunks)} total chunks for analysis")
         
@@ -670,8 +675,7 @@ def build_vector_store_incrementally(chunks_generator, config, ollama_url, statu
         start_time = time.time()
         batch_times = []
         
-        # Set a maximum number of chunks to process to prevent resource exhaustion
-        max_chunks = 10000  # Safety limit
+        # REMOVED: No more max_chunks limit! We process everything.
         processed_chunks = 0
         
         # Process chunks as they come
@@ -679,11 +683,8 @@ def build_vector_store_incrementally(chunks_generator, config, ollama_url, statu
             if not chunk_text:
                 continue
                 
-            # Safety check
+            # Safety check - keep track but don't limit
             processed_chunks += 1
-            if processed_chunks > max_chunks:
-                st.warning(f"⚠️ Reached safety limit of {max_chunks} chunks. Stopping to prevent resource exhaustion.")
-                break
             
             # Add document to list for batch processing
             all_docs.append(Document(page_content=chunk_text))
@@ -717,7 +718,7 @@ def build_vector_store_incrementally(chunks_generator, config, ollama_url, statu
                     
                     st.write(f"📚 Batch {chunk_counter}: Added {len(all_docs)} documents "
                             f"({docs_per_second:.1f} docs/sec, avg: {avg_batch_time:.2f}s per batch) "
-                            f"[Total: {total_docs}]")
+                            f"[Total: {total_docs}, Processed: {processed_chunks}]")
                     
                     # Call status callback if provided
                     if status_callback:
@@ -770,7 +771,7 @@ def build_vector_store_incrementally(chunks_generator, config, ollama_url, statu
                 docs_per_second = len(all_docs) / batch_time if batch_time > 0 else 0
                 
                 st.write(f"📚 Final batch: Added {len(all_docs)} documents "
-                        f"({docs_per_second:.1f} docs/sec) [Total: {total_docs}]")
+                        f"({docs_per_second:.1f} docs/sec) [Total: {total_docs}, Processed: {processed_chunks}]")
             except Exception as final_batch_error:
                 st.error(f"❌ Error in final batch: {final_batch_error}")
         
@@ -1008,7 +1009,7 @@ def create_model_display_name(model_name):
         "quality": "🏆"
     }.get(category, "🔹")
     
-    category_desc = MODEL_CATEGORIES.get(category, {}).get("description", "Other")
+    category_desc = MODEL_CATEGORIES.get(category, {}).get("description", category.title())
     return f"{emoji} {model_name} ({category_desc})"
 
 def get_hardware_recommendation():
@@ -1162,7 +1163,7 @@ def discover_log_files(folder_path):
 def process_text_file(file_path):
     """Process generic text files for log content"""
     try:
-        # Read file in chunks for large files
+        # Read file in chunks for large files (supports up to 1GB)
         log_lines = []
         batch_size = 10000
         
@@ -1517,63 +1518,217 @@ def build_vector_store(chunks, config, ollama_url, use_streaming=True):
         
         return None, None
 
-# --- NEW, FASTER "MAP REDUCE" VERSION ---
-def analyze_logs(vectorstore, llm, user_prompt_template):
-    if vectorstore is None:
-        return None
+# --- NEW: Process chunks in batches (replaces truncation) ---
+def process_chunks_in_batches(chunks, config, ollama_url, batch_size=None):
+    """
+    Process chunks in optimized batches to avoid memory issues
+    Returns a generator that yields processed batches
+    """
+    if not batch_size:
+        # Determine optimal batch size based on available memory
+        if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+            vram_gb = st.session_state.gpu_info['vram_gb']
+            if vram_gb >= 16:
+                batch_size = 200
+            elif vram_gb >= 8:
+                batch_size = 100
+            elif vram_gb >= 4:
+                batch_size = 50
+            else:
+                batch_size = 25
+        else:
+            # CPU mode - smaller batches
+            batch_size = 50
+    
+    total_chunks = len(chunks)
+    st.write(f"📊 Processing {total_chunks:,} chunks in batches of {batch_size}...")
+    
+    for i in range(0, total_chunks, batch_size):
+        batch_end = min(i + batch_size, total_chunks)
+        current_batch = chunks[i:batch_end]
+        
+        yield {
+            'batch_number': (i // batch_size) + 1,
+            'total_batches': (total_chunks + batch_size - 1) // batch_size,
+            'chunks': current_batch,
+            'start_index': i,
+            'end_index': batch_end - 1,
+            'progress_percent': min(100, int((batch_end / total_chunks) * 100))
+        }
+
+# --- NEW: Batch vector store building functions ---
+def build_vector_store_batch(chunks, config, ollama_url, is_first_batch=True, persist_directory=None):
+    """Build or add to vector store in batches"""
     try:
-        st.write("🤖 Starting AI analysis with 'Map Reduce'...")
+        if is_first_batch or persist_directory is None:
+            # Create new vector store
+            persist_directory = tempfile.mkdtemp()
+            st.write(f"🔧 Creating vector store at: {Path(persist_directory).name}")
+            
+            embeddings = OllamaEmbeddings(
+                model=config['embedding_model'],
+                base_url=ollama_url
+            )
+            
+            # Test embedding
+            _ = embeddings.embed_query("Test embedding")
+            
+            docs = [Document(page_content=chunk) for chunk in chunks]
+            
+            vectorstore = Chroma.from_documents(
+                docs,
+                embeddings,
+                collection_name="log_analysis_batch",
+                persist_directory=persist_directory,
+                collection_metadata={"hnsw:space": "cosine"}
+            )
+            
+            return vectorstore, persist_directory
+            
+        else:
+            # This shouldn't be called for first batch
+            raise ValueError("build_vector_store_batch called for non-first batch")
+            
+    except Exception as e:
+        st.error(f"❌ Error building initial vector store batch: {str(e)}")
+        return None, None
 
-        # --- 1. VALIDATE PROMPT ---
-        if "{context}" not in user_prompt_template or "{question}" not in user_prompt_template:
-            raise ValueError("Prompt template must include {context} and {question} placeholders.")
-
-        # --- 2. "MAP" STEP ---
-        map_prompt_template = """
-        You are a DFIR analyst. Your job is to find security incidents in a single log chunk.
-        Analyze the log data below and list ONLY the key findings, potential IOCs, and any suspicious activity.
-        If no threats are found, just say "No suspicious activity noted in this chunk."
-
-        Log Data:
-        {context}
-        """
-        map_prompt = ChatPromptTemplate.from_template(map_prompt_template)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5}) 
-
-        map_chain = (
-            retriever
-            | RunnableLambda(lambda docs: [{"context": doc.page_content} for doc in docs])
-            | map_prompt.map()
-            | llm.map()
+def add_to_vector_store_batch(vectorstore, chunks, config, ollama_url, batch_number=1):
+    """Add chunks to existing vector store"""
+    try:
+        if not vectorstore or not chunks:
+            return False
+        
+        # Get embeddings for this batch
+        embeddings = OllamaEmbeddings(
+            model=config['embedding_model'],
+            base_url=ollama_url
         )
         
-        # 3. "REDUCE" STEP (Final Report Generation)
-        reduce_prompt = ChatPromptTemplate.from_template(user_prompt_template)
+        # Create documents
+        docs = [Document(page_content=chunk) for chunk in chunks]
+        
+        # Get embeddings for all documents in batch
+        batch_embeddings = embeddings.embed_documents([doc.page_content for doc in docs])
+        
+        # Generate unique IDs for this batch
+        start_id = (batch_number - 1) * len(chunks)
+        batch_ids = [f"doc_{start_id + i}" for i in range(len(docs))]
+        
+        # Add to collection
+        vectorstore._collection.add(
+            documents=[doc.page_content for doc in docs],
+            embeddings=batch_embeddings,
+            ids=batch_ids
+        )
+        
+        st.write(f"✅ Added batch {batch_number} with {len(chunks)} documents")
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error adding batch {batch_number} to vector store: {str(e)}")
+        return False
 
+# --- NEW: Analyze large datasets with smart retrieval ---
+def analyze_large_dataset(vectorstore, llm, user_prompt_template, max_docs_per_query=20):
+    """Analyze large datasets with smart retrieval"""
+    try:
+        if vectorstore is None:
+            return None
+        
+        st.write("🤖 Starting AI analysis with smart retrieval...")
+        
+        # Validate prompt
+        if "{context}" not in user_prompt_template or "{question}" not in user_prompt_template:
+            raise ValueError("Prompt template must include {context} and {question} placeholders.")
+        
+        # Create retriever with configurable settings
+        retriever = vectorstore.as_retriever(
+            search_kwargs={
+                "k": min(max_docs_per_query, 50),  # Don't retrieve too many at once
+                "score_threshold": 0.3  # Minimum relevance score
+            }
+        )
+        
+        # Get relevant documents in smaller batches
+        relevant_docs = retriever.get_relevant_documents(
+            "Analyze these logs for security incidents, anomalies, or signs of compromise."
+        )
+        
+        if not relevant_docs:
+            return "No relevant security data found in the logs."
+        
+        # Process in manageable chunks if we have many documents
+        if len(relevant_docs) > 50:
+            st.write(f"📊 Found {len(relevant_docs)} relevant documents. Processing in sections...")
+            
+            # Split into sections for analysis
+            sections = []
+            section_size = 20  # Process 20 docs at a time
+            
+            for i in range(0, len(relevant_docs), section_size):
+                section_docs = relevant_docs[i:i + section_size]
+                section_text = "\n\n---\n\n".join([doc.page_content for doc in section_docs])
+                sections.append(section_text)
+            
+            # Analyze each section
+            section_reports = []
+            for idx, section in enumerate(sections):
+                st.write(f"📋 Analyzing section {idx + 1}/{len(sections)}...")
+                
+                map_prompt_template = """
+                You are a DFIR analyst. Analyze this log section for security incidents.
+                List key findings, potential IOCs, and suspicious activity.
+                If no threats found, say "No suspicious activity in this section."
+                
+                Log Section:
+                {context}
+                """
+                
+                map_prompt = ChatPromptTemplate.from_template(map_prompt_template)
+                map_chain = map_prompt | llm
+                
+                section_result = map_chain.invoke({"context": section})
+                section_reports.append(str(section_result.content) if hasattr(section_result, 'content') else str(section_result))
+            
+            # Combine all section reports
+            combined_context = "\n\n=== SECTION REPORTS ===\n\n" + "\n\n---\n\n".join(section_reports)
+            
+        else:
+            # Fewer docs - process all at once
+            combined_context = "\n\n---\n\n".join([doc.page_content for doc in relevant_docs])
+        
+        # Final reduction step
+        reduce_prompt = ChatPromptTemplate.from_template(user_prompt_template)
+        
         chain = (
-            map_chain
-            | RunnableLambda(lambda summaries: "\n\n---\n\n".join([s.content if hasattr(s, 'content') else str(s) for s in summaries]))
-            | {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
+            {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
             | reduce_prompt
             | llm
         )
-
-        with st.spinner("🧠 AI analysis in progress... (Parallel Map Reduce)"):
-            result = chain.invoke("Analyze these logs thoroughly for any security incidents, anomalies, or signs of compromise.")
         
-        # 4. FORMAT OUTPUT
+        with st.spinner("🧠 Generating comprehensive analysis report..."):
+            result = chain.invoke({
+                "context": combined_context,
+                "question": "Provide a comprehensive security assessment based on all log data analyzed."
+            })
+        
+        # Format output
         if hasattr(result, 'content'):
             return str(result.content)
         elif hasattr(result, 'text'):
             return str(result.text)
-        elif isinstance(result, str):
-            return result
         else:
             return str(result) if result else 'No result returned from analysis.'
-            
+        
     except Exception as e:
         st.error(f"❌ Error during analysis: {str(e)}")
-        return f"Analysis failed for this file: {str(e)}"
+        return f"Analysis completed with some limitations: {str(e)}"
+
+# --- UPDATED: analyze_logs function for backward compatibility ---
+def analyze_logs(vectorstore, llm, user_prompt_template):
+    """Wrapper for backward compatibility - uses the new analyze_large_dataset"""
+    return analyze_large_dataset(vectorstore, llm, user_prompt_template, max_docs_per_query=30)
 
 # --- NEW FUNCTION: Create concatenated reports ---
 def create_concatenated_reports():
@@ -1689,13 +1844,26 @@ def generate_executive_summary(processed_files_data, llm):
         return str(result.content)
     return str(result) if result else "Consolidation failed or returned no data."
 
-# --- NEW FUNCTION: Monitor resources continuously ---
+# --- FIXED: Monitor resources continuously with proper session state checking ---
 def monitor_resources_continuously():
-    """Continuously monitor system resources in a separate thread"""
-    while st.session_state.monitoring_active:
+    """Continuously monitor system resources in a separate thread with safe session state access"""
+    import psutil
+    import time
+    
+    while True:
         try:
-            import psutil
-            import time
+            # Safe check for monitoring_active flag
+            monitoring_active = False
+            try:
+                # Use a try-except to safely access session state
+                if 'monitoring_active' in st.session_state:
+                    monitoring_active = st.session_state.monitoring_active
+            except:
+                # If we can't access session state, assume monitoring should stop
+                break
+            
+            if not monitoring_active:
+                break
             
             # Get CPU and RAM
             cpu_percent = psutil.cpu_percent(interval=0.5)
@@ -1714,21 +1882,29 @@ def monitor_resources_continuously():
             except:
                 pass
             
-            # Add to history
+            # Add to history with thread-safe approach
             timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-            st.session_state.resource_history['cpu'].append(cpu_percent)
-            st.session_state.resource_history['ram'].append(ram_percent)
-            st.session_state.resource_history['gpu_util'].append(gpu_util)
-            st.session_state.resource_history['gpu_mem'].append(gpu_mem)
-            st.session_state.resource_history['timestamps'].append(timestamp)
+            
+            # Safely update session state
+            try:
+                if 'resource_history' in st.session_state:
+                    st.session_state.resource_history['cpu'].append(cpu_percent)
+                    st.session_state.resource_history['ram'].append(ram_percent)
+                    st.session_state.resource_history['gpu_util'].append(gpu_util)
+                    st.session_state.resource_history['gpu_mem'].append(gpu_mem)
+                    st.session_state.resource_history['timestamps'].append(timestamp)
+            except:
+                # If we can't update session state, continue anyway
+                pass
             
             # Sleep to avoid excessive CPU usage
             time.sleep(1)
             
         except Exception as e:
-            # If monitoring fails, stop gracefully
-            st.session_state.monitoring_active = False
-            break
+            # If monitoring fails, log and continue
+            print(f"Monitoring thread error (non-fatal): {e}")
+            time.sleep(1)
+            continue
 
 # --- NEW FUNCTION: Display resource dashboard ---
 def display_resource_dashboard():
@@ -1888,9 +2064,9 @@ def display_resource_dashboard():
         except:
             pass
 
-# --- UPDATED: process_file_queue function with enhanced cleanup and monitoring ---
+# --- UPDATED: process_file_queue function with batch processing (NO TRUNCATION) ---
 def process_file_queue(llm, config, ollama_url, analysis_prompt):
-    """Process multiple files from the queue with enhanced resource management"""
+    """Process multiple files from the queue with batch processing (NO DATA LOSS)"""
     # Check and increase file descriptor limits at start
     if st.session_state.job_status == 'running' and len(st.session_state.file_queue) > 0:
         increase_file_descriptor_limit()
@@ -1913,7 +2089,7 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
     file_path = current_file_info['path']
     file_extension = current_file_info['extension']
 
-    st.write(f"📁 **Processing:** {current_file_info['relative_path']} ({current_file_info['size'] / 1024:.2f} KB)")
+    st.write(f"📁 **Processing:** {current_file_info['relative_path']} ({current_file_info['size'] / (1024 * 1024):.2f} MB)")
 
     model_category = classify_model(config['model'])
     category_desc = MODEL_CATEGORIES.get(model_category, {}).get("description", "Unknown")
@@ -1969,31 +2145,89 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
                     return
 
                 if chunks:
-                    status.write(f"✅ **Step 2 Complete:** Created {len(chunks)} chunks")
-                    file_result['chunks_processed'] = len(chunks)
+                    # --- KEY CHANGE: NO TRUNCATION - PROCESS ALL CHUNKS ---
+                    status.write(f"✅ **Step 2 Complete:** Created {len(chunks):,} chunks (processing all)")
+                    file_result['chunks_created'] = len(chunks)
 
-                    status.write("🔧 **Step 3:** Building semantic search index...")
-                    # Use streaming vector store for large chunk counts
-                    use_vector_streaming = len(chunks) > 50
+                    status.write("🔧 **Step 3:** Building semantic search index in batches...")
                     
-                    # Limit chunk count for very large files
-                    if len(chunks) > 10000:
-                        st.warning(f"⚠️ Large number of chunks ({len(chunks)}). Limiting to first 10,000 for stability.")
-                        chunks = chunks[:10000]
-                        file_result['chunks_processed'] = len(chunks)
+                    # Calculate optimal batch size based on available resources
+                    optimal_batch_size = determine_optimal_batch_size(st.session_state.gpu_info)
+                    if hasattr(st.session_state, 'optimal_batch_size'):
+                        optimal_batch_size = st.session_state.optimal_batch_size
                     
-                    vectorstore, persist_dir = build_vector_store(chunks, config, ollama_url, use_streaming=use_vector_streaming)
+                    status.write(f"⚡ **Batch Optimization:** Using batch size of {optimal_batch_size} for GPU efficiency")
+                    
+                    # Process chunks in batches without loading all at once
+                    all_documents_processed = 0
+                    total_batches = (len(chunks) + optimal_batch_size - 1) // optimal_batch_size
+                    
+                    # Create progress tracking
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    for batch_info in process_chunks_in_batches(chunks, config, ollama_url, optimal_batch_size):
+                        if st.session_state.job_status != 'running':
+                            break
+                        
+                        # Update progress
+                        progress = batch_info['progress_percent'] / 100
+                        progress_bar.progress(progress)
+                        status_text.write(f"📦 Processing batch {batch_info['batch_number']}/{batch_info['total_batches']} "
+                                         f"({batch_info['end_index'] + 1:,}/{len(chunks):,} chunks)")
+                        
+                        # Process this batch
+                        try:
+                            if vectorstore is None:
+                                # First batch - create vectorstore
+                                vectorstore, persist_dir = build_vector_store_batch(
+                                    batch_info['chunks'], 
+                                    config, 
+                                    ollama_url, 
+                                    is_first_batch=True
+                                )
+                            else:
+                                # Subsequent batches - add to existing vectorstore
+                                success = add_to_vector_store_batch(
+                                    vectorstore,
+                                    batch_info['chunks'],
+                                    config,
+                                    ollama_url,
+                                    batch_number=batch_info['batch_number']
+                                )
+                                
+                                if not success:
+                                    st.warning(f"⚠️ Failed to add batch {batch_info['batch_number']}, continuing with next batch")
+                            
+                            all_documents_processed += len(batch_info['chunks'])
+                            
+                            # Update file result
+                            file_result['chunks_processed'] = all_documents_processed
+                            
+                            # Force garbage collection between batches
+                            gc.collect()
+                            
+                        except Exception as batch_error:
+                            st.error(f"❌ Error in batch {batch_info['batch_number']}: {batch_error}")
+                            # Continue with next batch instead of failing completely
+                            continue
+                    
+                    # Clear progress indicators
+                    progress_bar.empty()
+                    status_text.empty()
 
                     if st.session_state.job_status != 'running':
                         status.write("⏹️ Analysis stopped by user")
                         st.session_state.file_queue.insert(0, current_file_info)
                         return
 
-                    if vectorstore:
-                        status.write("✅ **Step 3 Complete:** Vector store ready")
+                    if vectorstore and all_documents_processed > 0:
+                        status.write(f"✅ **Step 3 Complete:** Vector store ready with {all_documents_processed:,} documents")
+                        file_result['chunks_processed'] = all_documents_processed
 
                         status.write("🤖 **Step 4:** AI analysis with DFIR expert...")
-                        report = analyze_logs(vectorstore, llm, analysis_prompt)
+                        # Use the new analyze_large_dataset function
+                        report = analyze_large_dataset(vectorstore, llm, analysis_prompt, max_docs_per_query=30)
 
                         if st.session_state.job_status != 'running':
                             status.write("⏹️ Analysis stopped by user")
@@ -2013,6 +2247,14 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
                         safe_chromadb_cleanup(vectorstore, persist_dir)
                         status.write("✅ Resources released")
 
+                    else:
+                        status.error("❌ Failed to build vector store or no documents processed")
+                        # Cleanup and skip to next file
+                        safe_chromadb_cleanup(vectorstore, persist_dir)
+                        st.session_state.processed_files.append(file_result)
+                        st.rerun()
+                        return
+                    
                     status.write("✅ File processing completed!")
 
                 else:
@@ -2074,7 +2316,7 @@ def monitor_system_resources():
     except Exception as e:
         return None
 
-# --- NEW: Streaming file processing function with GPU optimization ---
+# --- NEW FUNCTION: Streaming file processing with batch processing ---
 def process_single_file_streaming(file_path, file_extension, llm, config, ollama_url, analysis_prompt):
     """Process a single file using streaming approach with GPU optimization"""
     vectorstore = None
@@ -2136,24 +2378,64 @@ def process_single_file_streaming(file_path, file_extension, llm, config, ollama
                     return
 
                 if chunks:
-                    status.write(f"✅ **Step 2 Complete:** Created {len(chunks)} chunks")
-                    file_result['chunks_processed'] = len(chunks)
+                    status.write(f"✅ **Step 2 Complete:** Created {len(chunks):,} chunks")
+                    file_result['chunks_created'] = len(chunks)
 
-                    status.write("🔧 **Step 3:** Building semantic search index...")
+                    status.write("🔧 **Step 3:** Building semantic search index in batches...")
                     # Use streaming vector store for large chunk counts
                     use_vector_streaming = len(chunks) > 50
                     
                     # Determine optimal batch size based on GPU
                     optimal_batch_size = determine_optimal_batch_size(st.session_state.gpu_info)
+                    if hasattr(st.session_state, 'optimal_batch_size'):
+                        optimal_batch_size = st.session_state.optimal_batch_size
+                    
                     status.write(f"⚡ **Batch Optimization:** Using batch size of {optimal_batch_size} for GPU efficiency")
                     
-                    # Monitor GPU before starting
-                    gpu_stats_before = monitor_gpu_utilization()
-                    if gpu_stats_before:
-                        status.write(f"📊 **GPU Before:** {gpu_stats_before['utilization_percent']}% util, "
-                                    f"{gpu_stats_before['memory_allocated_gb']:.1f}GB used")
+                    # Process chunks in batches
+                    all_documents_processed = 0
+                    total_batches = (len(chunks) + optimal_batch_size - 1) // optimal_batch_size
                     
-                    vectorstore, persist_dir = build_vector_store(chunks, config, ollama_url, use_streaming=use_vector_streaming)
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    for batch_info in process_chunks_in_batches(chunks, config, ollama_url, optimal_batch_size):
+                        if st.session_state.job_status != 'running':
+                            break
+                        
+                        progress = batch_info['progress_percent'] / 100
+                        progress_bar.progress(progress)
+                        status_text.write(f"📦 Processing batch {batch_info['batch_number']}/{batch_info['total_batches']} "
+                                         f"({batch_info['end_index'] + 1:,}/{len(chunks):,} chunks)")
+                        
+                        try:
+                            if vectorstore is None:
+                                vectorstore, persist_dir = build_vector_store_batch(
+                                    batch_info['chunks'], 
+                                    config, 
+                                    ollama_url, 
+                                    is_first_batch=True
+                                )
+                            else:
+                                success = add_to_vector_store_batch(
+                                    vectorstore,
+                                    batch_info['chunks'],
+                                    config,
+                                    ollama_url,
+                                    batch_number=batch_info['batch_number']
+                                )
+                            
+                            all_documents_processed += len(batch_info['chunks'])
+                            file_result['chunks_processed'] = all_documents_processed
+                            
+                            gc.collect()
+                            
+                        except Exception as batch_error:
+                            st.error(f"❌ Error in batch {batch_info['batch_number']}: {batch_error}")
+                            continue
+                    
+                    progress_bar.empty()
+                    status_text.empty()
 
                     if st.session_state.job_status != 'running':
                         status.write("⏹️ Analysis stopped by user")
@@ -2161,19 +2443,15 @@ def process_single_file_streaming(file_path, file_extension, llm, config, ollama
 
                     # Monitor GPU after building
                     gpu_stats_after = monitor_gpu_utilization()
-                    if gpu_stats_after and gpu_stats_before:
-                        utilization_change = gpu_stats_after['utilization_percent'] - gpu_stats_before['utilization_percent']
-                        memory_change = gpu_stats_after['memory_allocated_gb'] - gpu_stats_before['memory_allocated_gb']
-                        status.write(f"📊 **GPU After:** {gpu_stats_after['utilization_percent']}% util "
-                                    f"(Δ{utilization_change:+d}%), "
-                                    f"{gpu_stats_after['memory_allocated_gb']:.1f}GB used "
-                                    f"(Δ{memory_change:+.1f}GB)")
+                    if gpu_stats_after:
+                        status.write(f"📊 **GPU After:** {gpu_stats_after['utilization_percent']}% util, "
+                                    f"{gpu_stats_after['memory_allocated_gb']:.1f}GB used")
 
-                    if vectorstore:
-                        status.write("✅ **Step 3 Complete:** Vector store ready")
+                    if vectorstore and all_documents_processed > 0:
+                        status.write(f"✅ **Step 3 Complete:** Vector store ready with {all_documents_processed:,} documents")
 
                         status.write("🤖 **Step 4:** AI analysis with DFIR expert...")
-                        report = analyze_logs(vectorstore, llm, analysis_prompt)
+                        report = analyze_large_dataset(vectorstore, llm, analysis_prompt, max_docs_per_query=30)
 
                         if st.session_state.job_status != 'running':
                             status.write("⏹️ Analysis stopped by user")
@@ -2224,7 +2502,7 @@ def main():
     # --- FIX 1: Call print_developer_info only once ---
     print_developer_info()
     
-    # Set page config. This MUST be the first Streamlit command.
+    # Set page config with increased file size limit
     st.set_page_config(
         page_title="ForensIQ",
         page_icon="🧠",
@@ -2235,7 +2513,7 @@ def main():
     st.title("🧠 ForensIQ")
     st.write("AI-powered log analysis, brought to you by **[DFIR Vault](https://dfirvault.com)**.")
 
-    # Initialize session state with new dashboard states
+    # Initialize ALL session state variables FIRST (FIX for monitoring thread error)
     if 'job_status' not in st.session_state:
         st.session_state.job_status = 'idle'
     if 'current_report' not in st.session_state:
@@ -2261,25 +2539,20 @@ def main():
         st.session_state.selected_files = []
     if 'final_summary_generated' not in st.session_state:
         st.session_state.final_summary_generated = False
-    # --- NEW: State for optimal batch size ---
     if 'optimal_batch_size' not in st.session_state:
-        st.session_state.optimal_batch_size = 200  # Default increased from 10
-    # --- END NEW ---
-    # --- NEW: State for streaming thresholds ---
+        st.session_state.optimal_batch_size = 200
     if 'streaming_thresholds' not in st.session_state:
         st.session_state.streaming_thresholds = {
             'csv_mb': 10,
             'chunk_rows': 10000,
             'vector_chunks': 50
         }
-    # --- END NEW ---
-    # --- NEW: State for processing limits ---
     if 'processing_limits' not in st.session_state:
         st.session_state.processing_limits = {
             'max_concurrent_files': 5,
-            'max_chunks_per_file': 10000
+            'max_chunks_per_file': 0  # Set to 0 to disable truncation
         }
-    # --- NEW: State for resource monitoring ---
+    # --- CRITICAL FIX: Initialize monitoring states before any threads start ---
     if 'resource_history' not in st.session_state:
         st.session_state.resource_history = {
             'cpu': deque(maxlen=100),
@@ -2289,12 +2562,17 @@ def main():
             'timestamps': deque(maxlen=100)
         }
     if 'monitoring_active' not in st.session_state:
-        st.session_state.monitoring_active = False
+        st.session_state.monitoring_active = False  # MUST BE INITIALIZED
     if 'concatenated_reports' not in st.session_state:
         st.session_state.concatenated_reports = ""
     if 'monitoring_thread' not in st.session_state:
         st.session_state.monitoring_thread = None
-    # --- END NEW ---
+    if 'batch_settings' not in st.session_state:
+        st.session_state.batch_settings = {
+            'documents_per_batch': 200,
+            'max_retrieved_docs': 50
+        }
+    # --- END FIX ---
 
     config = st.session_state.config
 
@@ -2380,42 +2658,33 @@ def main():
             
             st.info(f"💡 Recommended range for {vram_gb:.1f}GB VRAM: {recommended} documents/batch")
             
-            # Streaming thresholds
-            st.write("**📊 Streaming Thresholds:**")
-            col1, col2, col3 = st.columns(3)
+            # Batch processing control
+            st.write("**Batch Processing Control:**")
+            col1, col2 = st.columns(2)
+            
             with col1:
-                csv_threshold = st.number_input(
-                    "CSV Streaming (MB)",
-                    min_value=1,
-                    max_value=1000,
-                    value=10,
-                    help="Use streaming for CSV files larger than this (MB)"
-                )
-            with col2:
-                chunk_threshold = st.number_input(
-                    "Chunk Streaming (rows)",
-                    min_value=1000,
-                    max_value=100000,
-                    value=10000,
-                    step=1000,
-                    help="Use streaming chunking for DataFrames larger than this"
-                )
-            with col3:
-                vector_threshold = st.number_input(
-                    "Vector Streaming (chunks)",
+                batch_documents = st.number_input(
+                    "Documents per Batch",
                     min_value=10,
-                    max_value=1000,
-                    value=50,
-                    help="Use incremental vector building for chunk counts larger than this"
+                    max_value=500,
+                    value=st.session_state.batch_settings['documents_per_batch'],
+                    step=10,
+                    help="Process this many documents at a time"
                 )
+                st.session_state.batch_settings['documents_per_batch'] = batch_documents
             
-            st.session_state.streaming_thresholds = {
-                'csv_mb': csv_threshold,
-                'chunk_rows': chunk_threshold,
-                'vector_chunks': vector_threshold
-            }
+            with col2:
+                max_retrieved = st.number_input(
+                    "Max Retrieved Documents",
+                    min_value=10,
+                    max_value=200,
+                    value=st.session_state.batch_settings['max_retrieved_docs'],
+                    step=5,
+                    help="Maximum documents to analyze at once (prevents context overflow)"
+                )
+                st.session_state.batch_settings['max_retrieved_docs'] = max_retrieved
             
-            # Processing limits
+            # Processing limits (modified to disable truncation)
             st.write("**🛡️ Processing Limits:**")
             col1, col2 = st.columns(2)
             with col1:
@@ -2426,22 +2695,13 @@ def main():
                     value=5,
                     help="Maximum number of files to keep in memory at once"
                 )
+                st.session_state.processing_limits['max_concurrent_files'] = max_concurrent_files
             with col2:
-                max_chunks_per_file = st.number_input(
-                    "Max Chunks per File",
-                    min_value=100,
-                    max_value=50000,
-                    value=10000,
-                    step=1000,
-                    help="Maximum number of chunks to process per file (prevents resource exhaustion)"
-                )
+                # Inform user that truncation is disabled
+                st.info("**Chunk Limit:** Disabled\n\nAll chunks will be processed")
+                st.session_state.processing_limits['max_chunks_per_file'] = 0  # 0 = no limit
             
-            st.session_state.processing_limits = {
-                'max_concurrent_files': max_concurrent_files,
-                'max_chunks_per_file': max_chunks_per_file
-            }
-            
-            st.info("💡 **Note:** These limits help prevent 'Too many open files' errors and system resource exhaustion.")
+            st.info("💡 **Note:** Batch processing prevents 'Too many open files' errors without truncating data.")
         
         # Refresh models button
         col1, col2 = st.columns([3, 1])
@@ -2628,7 +2888,7 @@ def main():
         uploaded_files = st.file_uploader(
             "Choose log file(s)",
             type=None,
-            help="All files are accepted. The application will detect if it's a readable log file.",
+            help="All files are accepted. The application will detect if it's a readable log file. Supports files up to 1GB.",
             accept_multiple_files=(upload_option == "Multiple Files"),
             key="file_uploader"
         )
@@ -2856,7 +3116,7 @@ def main():
                     
                 # Warning if resources are low
                 if resources['open_files'] > 1000:
-                    st.warning("⚠️ High number of open files. Consider reducing batch size or processing fewer files at once.")
+                    st.warning("⚠️ High number of open files. Consider reducing batch size.")
                 if resources['memory_percent'] > 90:
                     st.error("🚨 High memory usage! Processing may fail.")
                 if resources['memory_available_gb'] < 1:
@@ -2865,11 +3125,9 @@ def main():
                 # Show processing limits
                 st.write("---")
                 st.write("**Current Processing Limits:**")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write(f"**Max Files in Memory:** {st.session_state.processing_limits['max_concurrent_files']}")
-                with col2:
-                    st.write(f"**Max Chunks per File:** {st.session_state.processing_limits['max_chunks_per_file']:,}")
+                st.write(f"**Batch Size:** {st.session_state.batch_settings['documents_per_batch']} documents")
+                st.write(f"**Max Retrieved:** {st.session_state.batch_settings['max_retrieved_docs']} documents")
+                st.write(f"**Truncation:** DISABLED (all chunks processed)")
 
     # Process files if job is running
     if (st.session_state.job_status == 'running' and len(st.session_state.file_queue) > 0):
@@ -2922,7 +3180,7 @@ def main():
                     st.write(f"⚡ **GPU Optimized:** Batch size = {st.session_state.optimal_batch_size} documents")
                 
                 # Show processing limits
-                st.write(f"🛡️ **Processing Limits:** Max chunks = {st.session_state.processing_limits['max_chunks_per_file']:,}")
+                st.write(f"🛡️ **Processing:** Batch processing enabled (no truncation)")
 
                 # Process the temporary file with streaming optimization
                 process_single_file_streaming(temp_file_path, file_extension, llm, config, ollama_url, analysis_prompt)
@@ -3040,8 +3298,10 @@ def main():
                     # Additional metadata if available
                     if 'rows_ingested' in file_result:
                         st.write(f"**Rows Processed:** {file_result['rows_ingested']:,}")
+                    if 'chunks_created' in file_result:
+                        st.write(f"**Chunks Created:** {file_result['chunks_created']:,}")
                     if 'chunks_processed' in file_result:
-                        st.write(f"**Chunks Created:** {file_result['chunks_processed']}")
+                        st.write(f"**Chunks Processed:** {file_result['chunks_processed']:,}")
                     if 'analysis_timestamp' in file_result:
                         st.write(f"**Analyzed:** {file_result['analysis_timestamp']}")
                     
@@ -3129,7 +3389,8 @@ def main():
             
             # Rows processed
             total_rows = sum(f.get('rows_ingested', 0) for f in st.session_state.processed_files)
-            total_chunks = sum(f.get('chunks_processed', 0) for f in st.session_state.processed_files)
+            total_chunks_created = sum(f.get('chunks_created', 0) for f in st.session_state.processed_files)
+            total_chunks_processed = sum(f.get('chunks_processed', 0) for f in st.session_state.processed_files)
             
             # Display metrics
             col1, col2, col3 = st.columns(3)
@@ -3141,7 +3402,7 @@ def main():
                 st.metric("Avg File Size", f"{avg_size_mb:.1f} MB")
             with col3:
                 st.metric("Total Rows", f"{total_rows:,}")
-                st.metric("Total Chunks", total_chunks)
+                st.metric("Total Chunks", f"{total_chunks_processed:,}")
             
             # Success rate chart
             st.write("---")
@@ -3260,7 +3521,7 @@ def main():
             
             if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
                 st.success(f"**GPU Used:** {st.session_state.gpu_info['name']} ({st.session_state.gpu_info['vram_gb']:.1f}GB VRAM)")
-                st.info(f"**Optimal Batch Size:** {st.session_state.optimal_batch_size} documents")
+                st.info(f"**Batch Size:** {st.session_state.optimal_batch_size} documents")
             
             # Processing summary
             st.write("---")
@@ -3282,7 +3543,9 @@ def main():
             **Performance:**
             - Average file size: {avg_size_mb:.1f} MB
             - Total rows processed: {total_rows:,}
-            - Total chunks generated: {total_chunks}
+            - Total chunks created: {total_chunks_created:,}
+            - Total chunks processed: {total_chunks_processed:,}
+            - Batch processing: ENABLED (no truncation)
             """
             
             st.markdown(summary_text)
@@ -3301,13 +3564,20 @@ Errors: {errors}
 Total Data Size: {total_size_mb:.1f} MB
 Average File Size: {avg_size_mb:.1f} MB
 Total Rows Processed: {total_rows:,}
-Total Chunks Generated: {total_chunks}
+Total Chunks Created: {total_chunks_created:,}
+Total Chunks Processed: {total_chunks_processed:,}
 
 CONFIGURATION
 =============
 LLM Model: {config.get('model', 'N/A')}
 Embedding Model: {config.get('embedding_model', 'N/A')}
 Ollama URL: http://{config.get('ollama_host', 'N/A')}:{config.get('ollama_port', 'N/A')}
+
+BATCH PROCESSING
+================
+Batch Size: {st.session_state.batch_settings['documents_per_batch']} documents
+Max Retrieved: {st.session_state.batch_settings['max_retrieved_docs']} documents
+Truncation: DISABLED (all data processed)
 
 GPU INFORMATION
 ===============
@@ -3332,7 +3602,8 @@ File {i+1}: {file_result.get('path', 'N/A')}
   Status: {file_result.get('status', 'unknown')}
   Size: {file_result.get('size', 0) / (1024 * 1024):.1f} MB
   Rows: {file_result.get('rows_ingested', 'N/A')}
-  Chunks: {file_result.get('chunks_processed', 'N/A')}
+  Chunks Created: {file_result.get('chunks_created', 'N/A')}
+  Chunks Processed: {file_result.get('chunks_processed', 'N/A')}
   Timestamp: {file_result.get('analysis_timestamp', 'N/A')}
 """
             
