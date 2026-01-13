@@ -9,6 +9,8 @@ from langchain_core.documents import Document
 from langchain_core.runnables import RunnableSequence, RunnablePassthrough, RunnableLambda
 import datetime
 import pynvml
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*pynvml package is deprecated.*")
 import chromadb
 import requests
 import subprocess
@@ -62,6 +64,22 @@ except ImportError:
     chardet = None
     st.info("💡 Install `chardet` for better encoding detection")
 
+def check_chromadb_compatibility():
+    """Check if chromadb supports score_threshold parameter"""
+    try:
+        import chromadb
+        # Try to create a mock query to check if score_threshold is supported
+        # We'll check the version instead
+        version = chromadb.__version__
+        major, minor, patch = map(int, version.split('.')[:3])
+        # score_threshold was likely added around version 0.4.18+
+        return major > 0 or (major == 0 and minor >= 4)
+    except:
+        return False
+
+# Store compatibility result
+CHROMADB_SUPPORTS_SCORE_THRESHOLD = check_chromadb_compatibility()
+
 # Config file path
 CONFIG_FILE = 'config.txt'
 
@@ -90,25 +108,32 @@ COMMON_LOG_FILES = {
     'application', 'access', 'error', 'events'
 }
 
-# --- UPDATED: Default "Reduce" Prompt ---
-DEFAULT_DFIR_PROMPT = """You are a senior DFIR (Digital Forensics and Incident Response) analyst with 15+ years of experience.
+# --- UPDATED: Detailed DFIR Prompt for Comprehensive Analysis ---
+DEFAULT_DFIR_PROMPT = """You are a cybersecurity analyst. Analyze these Windows event logs and answer:
 
-You will be given several summaries of threats found in different log chunks. Your job is to combine these summaries into one comprehensive, final report.
+1. List all suspicious IP addresses and why they're suspicious
+2. List all suspicious user accounts and activities
+3. Find evidence of these specific threats:
+   - RDP tunneling/port forwarding
+   - Password hash attacks (NTLMv1 usage)
+   - Log clearing
+   - Unusual process execution (especially plink.exe)
+   - Lateral movement between systems
 
-Provide a comprehensive security assessment with the following sections, based *only* on the context provided:
+4. Create a timeline of malicious events from first to last
+5. Rate the overall threat level (1-10) with explanation
+6. Suggest 3 immediate actions to take
 
-1.  **EXECUTIVE SUMMARY:** High-level overview of findings.
-2.  **KEY FINDINGS:** Specific security events detected.
-3.  **SEVERITY ASSESSMENT:** Critical/High/Medium/Low ratings with justification.
-4.  **INDICATORS OF COMPROMISE:** Specific IOCs identified (IPs, hashes, filenames, user accounts).
-5.  **RECOMMENDATIONS:** Concrete steps for investigation and remediation.
-6.  **TIMELINE:** Chronological sequence of notable events (if detectable).
+Format as:
+- IOCs: [list]
+- Timeline: [list]
+- Threat Level: [number/10]
+- Actions: [list]
 
-Be thorough, professional, and focus on actionable intelligence. If no clear threats are found, state so clearly.
-
-Context (Summaries from Log Chunks): {context}
+Context (Log Data for Analysis): {context}
 
 Question: {question}
+
 """
 # --- END UPDATE ---
 
@@ -154,6 +179,20 @@ MODEL_CATEGORIES = {
             "codellama:7b", "codellama:7b-instruct"
         ],
         "priority": 3
+    },
+    "detailed_analysis": {
+        "description": "📊 Detailed Analysis (Best for Reports)",
+        "models": [
+            "llama3.1:70b-instruct-q4_0",
+            "llama3.1:70b-instruct-q8_0",
+            "qwen2.5:72b-instruct-q4_0",
+            "mixtral:8x22b-instruct-q4_0",
+            "dolphin-llama3.1:70b",
+            "wizardlm2:7b",  # Good at detailed explanations
+            "Yeah ",  # Excellent for structured responses
+            "command-r-plus:104b"  # If you have enough RAM/VRAM
+        ],
+        "priority": 6
     },
     "balanced": {
         "description": "🎯 Balanced (Better Quality)",
@@ -1076,7 +1115,17 @@ def refresh_ollama_connection(config):
         available_models = get_available_models(ollama_url)
         recommended_models = get_recommended_models(available_models)
         
-        llm = OllamaLLM(model=config['model'], base_url=ollama_url)
+        # Enhanced LLM with parameters for detailed responses
+        llm = OllamaLLM(
+            model=config['model'],
+            base_url=ollama_url,
+            temperature=0.7,  # Increased for more creative/detailed responses
+            top_p=0.9,  # Nucleus sampling for diversity
+            num_predict=8192,  # Maximum tokens to generate (increase for longer responses)
+            repeat_penalty=1.1,  # Penalize repetition
+            num_ctx=8192,  # Context window size
+            # streaming=True  # Optional: for streaming responses
+        )
         
         return {
             "success": True,
@@ -1635,84 +1684,115 @@ def analyze_large_dataset(vectorstore, llm, user_prompt_template, max_docs_per_q
     try:
         if vectorstore is None:
             return None
-        
+       
         st.write("🤖 Starting AI analysis with smart retrieval...")
-        
+       
         # Validate prompt
         if "{context}" not in user_prompt_template or "{question}" not in user_prompt_template:
             raise ValueError("Prompt template must include {context} and {question} placeholders.")
-        
-        # Create retriever with configurable settings
-        retriever = vectorstore.as_retriever(
-            search_kwargs={
-                "k": min(max_docs_per_query, 50),  # Don't retrieve too many at once
-                "score_threshold": 0.3  # Minimum relevance score
-            }
+       
+        # Create retriever - COMPATIBLE VERSION
+        try:
+            if CHROMADB_SUPPORTS_SCORE_THRESHOLD:
+                # Newer chromadb version with score_threshold
+                retriever = vectorstore.as_retriever(
+                    search_kwargs={
+                        "k": min(max_docs_per_query, 50)
+                    }
+                )
+            else:
+                # Older chromadb version
+                retriever = vectorstore.as_retriever(
+                    search_kwargs={
+                        "k": min(max_docs_per_query, 50),
+                    }
+                )
+        except Exception as e:
+            # Fallback to simplest retriever
+            st.warning(f"⚠️ Retriever creation issue: {e}. Using simple retriever.")
+            retriever = vectorstore.as_retriever(
+                search_kwargs={"k": min(max_docs_per_query, 30)}
+            )
+       
+        # Get relevant documents
+        relevant_docs = retriever.invoke(
+            "Analyze these logs for security incidents, anomalies, or signs of compromise. " +
+            "Look for: malicious activity, unauthorized access, data exfiltration, " +
+            "privilege escalation, lateral movement, command and control communications, " +
+            "data theft, ransomware indicators, brute force attacks, vulnerability exploitation."
         )
-        
-        # Get relevant documents in smaller batches
-        relevant_docs = retriever.get_relevant_documents(
-            "Analyze these logs for security incidents, anomalies, or signs of compromise."
-        )
-        
+       
         if not relevant_docs:
-            return "No relevant security data found in the logs."
-        
+            return "## No Relevant Security Data Found\n\nAfter thorough analysis of the provided log data, no clear indicators of compromise or malicious activity were detected. This could indicate:\n\n1. **Clean System**: No security incidents in the analyzed timeframe\n2. **Limited Logging**: Security events may not be captured in these logs\n3. **Sophisticated Attack**: Threats may be using evasion techniques\n\n**Recommendations:**\n- Review additional log sources (network, endpoint, cloud)\n- Implement enhanced logging for security events\n- Consider proactive threat hunting exercises"
+       
         # Process in manageable chunks if we have many documents
-        if len(relevant_docs) > 50:
+        if len(relevant_docs) > 30:
             st.write(f"📊 Found {len(relevant_docs)} relevant documents. Processing in sections...")
-            
+           
             # Split into sections for analysis
             sections = []
-            section_size = 20  # Process 20 docs at a time
-            
+            section_size = 15  # Process 15 docs at a time for better quality
+           
             for i in range(0, len(relevant_docs), section_size):
                 section_docs = relevant_docs[i:i + section_size]
-                section_text = "\n\n---\n\n".join([doc.page_content for doc in section_docs])
+                section_text = "\n\n" + "="*50 + f"\nSECTION {i//section_size + 1}\n" + "="*50 + "\n\n"
+                section_text += "\n\n--- LOG CHUNK ---\n\n".join([doc.page_content for doc in section_docs])
                 sections.append(section_text)
-            
-            # Analyze each section
+           
+            # Analyze each section with a detailed prompt
             section_reports = []
             for idx, section in enumerate(sections):
                 st.write(f"📋 Analyzing section {idx + 1}/{len(sections)}...")
-                
+               
                 map_prompt_template = """
-                You are a DFIR analyst. Analyze this log section for security incidents.
-                List key findings, potential IOCs, and suspicious activity.
-                If no threats found, say "No suspicious activity in this section."
+                You are a DFIR analyst analyzing a section of log data.
+                
+                Provide DETAILED analysis including:
+                1. Specific security events found
+                2. Exact log patterns that indicate threats
+                3. Technical analysis of each finding
+                4. Potential impact if confirmed
+                5. Recommended immediate investigation steps
+                
+                Be specific and cite exact log content when possible.
+                If no threats found, explain what normal activity looks like.
                 
                 Log Section:
                 {context}
                 """
-                
+               
                 map_prompt = ChatPromptTemplate.from_template(map_prompt_template)
                 map_chain = map_prompt | llm
-                
+               
                 section_result = map_chain.invoke({"context": section})
-                section_reports.append(str(section_result.content) if hasattr(section_result, 'content') else str(section_result))
-            
+                section_report = str(section_result.content) if hasattr(section_result, 'content') else str(section_result)
+                section_reports.append(f"\n{'='*60}\nSECTION {idx + 1} ANALYSIS\n{'='*60}\n\n{section_report}")
+           
             # Combine all section reports
-            combined_context = "\n\n=== SECTION REPORTS ===\n\n" + "\n\n---\n\n".join(section_reports)
-            
+            combined_context = "\n\n".join(section_reports)
+           
         else:
-            # Fewer docs - process all at once
-            combined_context = "\n\n---\n\n".join([doc.page_content for doc in relevant_docs])
-        
-        # Final reduction step
+            # Fewer docs - process all at once with detailed context
+            combined_context = "\n\n".join([
+                f"\n{'='*40}\nLOG CHUNK {i+1}\n{'='*40}\n{doc.page_content}"
+                for i, doc in enumerate(relevant_docs)
+            ])
+       
+        # Final reduction step with enhanced prompt
         reduce_prompt = ChatPromptTemplate.from_template(user_prompt_template)
-        
+       
         chain = (
             {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
             | reduce_prompt
             | llm
         )
-        
-        with st.spinner("🧠 Generating comprehensive analysis report..."):
+       
+        with st.spinner("🧠 Generating comprehensive analysis report... This may take a moment for detailed analysis."):
             result = chain.invoke({
                 "context": combined_context,
-                "question": "Provide a comprehensive security assessment based on all log data analyzed."
+                "question": "Provide an EXTREMELY DETAILED security assessment based on all log data analyzed. Include specific findings, technical analysis, IOCs, timelines, and actionable recommendations."
             })
-        
+       
         # Format output
         if hasattr(result, 'content'):
             return str(result.content)
@@ -1720,10 +1800,10 @@ def analyze_large_dataset(vectorstore, llm, user_prompt_template, max_docs_per_q
             return str(result.text)
         else:
             return str(result) if result else 'No result returned from analysis.'
-        
+       
     except Exception as e:
         st.error(f"❌ Error during analysis: {str(e)}")
-        return f"Analysis completed with some limitations: {str(e)}"
+        return f"## Analysis Completed with Limitations\n\n**Error encountered:** {str(e)}\n\n**Partial analysis completed.** Please review the processed logs manually for security findings."
 
 # --- UPDATED: analyze_logs function for backward compatibility ---
 def analyze_logs(vectorstore, llm, user_prompt_template):
@@ -2236,11 +2316,15 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
 
                         if report:
                             status.write("✅ **Step 4 Complete:** Analysis complete!")
-
+                            
                             # Store enhanced report data
                             file_result['report'] = str(report) if not isinstance(report, str) else report
                             file_result['status'] = 'success'
                             file_result['analysis_complete'] = True
+                            
+                            # Store the report in current_report for single file analysis
+                            if len(st.session_state.file_queue) == 0:  # Last file
+                                st.session_state.current_report = file_result['report']  # Use file_result['report']
                         
                         # Enhanced cleanup of vector store
                         status.write("🧹 Releasing vector store resources...")
@@ -2465,8 +2549,8 @@ def process_single_file_streaming(file_path, file_extension, llm, config, ollama
                             file_result['status'] = 'success'
                             file_result['analysis_complete'] = True
                             
-                            # Store in session state
-                            st.session_state.current_report = report
+                            # Store in session state - FIXED HERE
+                            st.session_state.current_report = file_result['report']  # Use file_result['report']
                             st.session_state.final_summary_generated = True
                             st.session_state.job_status = 'completed'
                             st.session_state.processed_files.append(file_result)
@@ -2539,6 +2623,8 @@ def main():
         st.session_state.selected_files = []
     if 'final_summary_generated' not in st.session_state:
         st.session_state.final_summary_generated = False
+    if 'concatenated_reports' not in st.session_state:
+        st.session_state.concatenated_reports = ""
     if 'optimal_batch_size' not in st.session_state:
         st.session_state.optimal_batch_size = 200
     if 'streaming_thresholds' not in st.session_state:
@@ -3198,42 +3284,20 @@ def main():
             process_file_queue(llm, config, ollama_url, analysis_prompt)
 
     # --- UPDATED: Enhanced Report Display Logic with Dashboard Features ---
-    elif st.session_state.job_status == 'completed' and st.session_state.processed_files:
+    # MOVED OUTSIDE the processing if block - this is the critical fix!
+    if st.session_state.job_status == 'completed' and st.session_state.processed_files:
         
         # Create tabs for different report views
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Executive Summary", "📋 Detailed Reports", "📦 Concatenated Reports", "📈 Statistics & Dashboard"])
         
         with tab1:
-            # 1. Check if the final executive summary has run (only for bulk analysis)
-            is_bulk_analysis = len(st.session_state.processed_files) > 1 or (len(st.session_state.processed_files) == 1 and st.session_state.file_queue)
-            
-            if is_bulk_analysis and not st.session_state.final_summary_generated:
-                st.subheader("Finalizing Analysis...")
-                
-                # Get LLM connection info
-                connection_info = st.session_state.connection_info
-                llm = connection_info["llm"]
-                
-                # Pass the structured data to the final consolidation function
-                final_summary = generate_executive_summary(st.session_state.processed_files, llm)
-                
-                # Update session state with the final result
-                st.session_state.current_report = final_summary
-                st.session_state.final_summary_generated = True
-                
-                # Rerun to display the final summary
-                st.rerun() 
-                
-            # 2. Display the Executive Summary
+            # Display the Executive Summary
             if st.session_state.current_report:
-                if st.session_state.final_summary_generated:
-                    st.subheader("📊 FINAL DFIR EXECUTIVE SUMMARY")
-                    st.markdown("**Report Status:** ✅ All file analysis completed and findings consolidated.")
-                elif len(st.session_state.processed_files) == 1: # Single file result, report already generated
-                    st.subheader(f"📊 DFIR Analysis Report for {st.session_state.processed_files[0]['path']}")
-
+                st.subheader("📊 FINAL DFIR EXECUTIVE SUMMARY")
+                st.markdown("**Report Status:** ✅ Analysis completed")
+                
                 st.text_area("Detailed Security Assessment", st.session_state.current_report, height=500, key="executive_report")
-
+                
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 exec_filename = f"dfir_executive_summary_{timestamp}.txt"
                 st.download_button(
@@ -3244,7 +3308,29 @@ def main():
                     key="download_executive"
                 )
             else:
-                st.info("No executive summary generated. Processing may have completed without generating a consolidated report.")
+                # Generate executive summary if not already generated
+                if len(st.session_state.processed_files) > 0:
+                    st.info("Generating executive summary...")
+                    
+                    # Get LLM connection info
+                    connection_info = st.session_state.connection_info
+                    if connection_info and connection_info.get("llm"):
+                        llm = connection_info["llm"]
+                        
+                        # Generate final summary
+                        with st.spinner("Generating executive summary..."):
+                            final_summary = generate_executive_summary(st.session_state.processed_files, llm)
+                        
+                        # Update session state with the final result
+                        st.session_state.current_report = final_summary
+                        st.session_state.final_summary_generated = True
+                        
+                        # Rerun to display the final summary
+                        st.rerun()
+                    else:
+                        st.warning("LLM connection not available for generating executive summary")
+                else:
+                    st.info("No executive summary generated. Processing may have completed without generating a consolidated report.")
         
         with tab2:
             st.subheader("📋 DETAILED FILE REPORTS")
@@ -3318,7 +3404,7 @@ def main():
                         
                         # Individual file download button
                         safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '-', '_')).rstrip()
-                        detailed_filename = f"dfir_detailed_{safe_filename}_{timestamp if 'timestamp' in locals() else datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                        detailed_filename = f"dfir_detailed_{safe_filename}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
                         
                         st.download_button(
                             label=f"📥 Download {file_name} Report",
@@ -3366,7 +3452,7 @@ def main():
                     st.success("✅ This concatenated report was successfully fed into the LLM to generate the comprehensive executive summary.")
                     st.info("💡 **Note:** The executive summary in Tab 1 is based on this complete context, ensuring all file-specific findings are considered in the final analysis.")
                 else:
-                    st.warning("⚠️ This concatenated report has not yet been used to generate an executive summary. Run bulk analysis to create a final summary.")
+                    st.warning("⚠️ This concatenated report has not yet been used to generate an executive summary.")
             else:
                 st.info("No detailed reports available to concatenate.")
         
@@ -3374,7 +3460,9 @@ def main():
             st.subheader("📈 PROCESSING STATISTICS & DASHBOARD")
             
             # Display resource dashboard
-            display_resource_dashboard()
+            if st.session_state.resource_history and st.session_state.resource_history['cpu']:
+                display_resource_dashboard()
+            
             st.write("---")
             
             # Calculate statistics
@@ -3438,8 +3526,6 @@ def main():
                 file_names = [f.get('name', f"File {i+1}") for i, f in enumerate(successful_reports)]
                 
                 # Create bar chart
-                import plotly.graph_objects as go
-                
                 fig = go.Figure(data=[
                     go.Bar(
                         x=file_names,
@@ -3459,161 +3545,161 @@ def main():
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
-            
-            # Processing timeline
-            st.write("---")
-            st.subheader("Processing Timeline")
-            
-            if 'analysis_timestamp' in st.session_state.processed_files[0]:
-                timeline_data = []
-                for file_result in st.session_state.processed_files:
-                    if 'analysis_timestamp' in file_result:
-                        try:
-                            timestamp = datetime.datetime.fromisoformat(file_result['analysis_timestamp'])
-                            timeline_data.append({
-                                'file': file_result.get('name', 'Unknown'),
-                                'timestamp': timestamp,
-                                'status': file_result.get('status', 'unknown'),
-                                'size_mb': file_result.get('size', 0) / (1024 * 1024)
-                            })
-                        except:
-                            continue
                 
-                if timeline_data:
-                    # Sort by timestamp
-                    timeline_data.sort(key=lambda x: x['timestamp'])
+                # Processing timeline
+                st.write("---")
+                st.subheader("Processing Timeline")
+                
+                if 'analysis_timestamp' in st.session_state.processed_files[0]:
+                    timeline_data = []
+                    for file_result in st.session_state.processed_files:
+                        if 'analysis_timestamp' in file_result:
+                            try:
+                                timestamp = datetime.datetime.fromisoformat(file_result['analysis_timestamp'])
+                                timeline_data.append({
+                                    'file': file_result.get('name', 'Unknown'),
+                                    'timestamp': timestamp,
+                                    'status': file_result.get('status', 'unknown'),
+                                    'size_mb': file_result.get('size', 0) / (1024 * 1024)
+                                })
+                            except:
+                                continue
                     
-                    # Create timeline visualization
-                    timeline_html = """
-                    <div style="margin: 20px 0; padding: 20px; background: #f5f5f5; border-radius: 10px;">
-                        <h4 style="margin-top: 0;">Processing Timeline</h4>
-                    """
-                    
-                    for item in timeline_data:
-                        status_color = {
-                            'success': '#28a745',
-                            'skipped': '#ffc107',
-                            'error': '#dc3545'
-                        }.get(item['status'], '#6c757d')
+                    if timeline_data:
+                        # Sort by timestamp
+                        timeline_data.sort(key=lambda x: x['timestamp'])
                         
-                        time_str = item['timestamp'].strftime("%H:%M:%S")
-                        timeline_html += f"""
-                        <div style="display: flex; align-items: center; margin: 10px 0; padding: 10px; background: white; border-radius: 5px; border-left: 5px solid {status_color};">
-                            <div style="flex: 0 0 80px; font-weight: bold;">{time_str}</div>
-                            <div style="flex: 1;">{item['file']}</div>
-                            <div style="flex: 0 0 60px; text-align: right; font-weight: bold; color: {status_color};">{item['status'].upper()}</div>
-                            <div style="flex: 0 0 80px; text-align: right;">{item['size_mb']:.1f} MB</div>
-                        </div>
+                        # Create timeline visualization
+                        timeline_html = """
+                        <div style="margin: 20px 0; padding: 20px; background: #f5f5f5; border-radius: 10px;">
+                            <h4 style="margin-top: 0;">Processing Timeline</h4>
                         """
-                    
-                    timeline_html += "</div>"
-                    st.markdown(timeline_html, unsafe_allow_html=True)
-            
-            # Model information
-            st.write("---")
-            st.subheader("Model Information")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.info(f"**LLM Model:** {config.get('model', 'Not specified')}")
-            with col2:
-                st.info(f"**Embedding Model:** {config.get('embedding_model', 'Not specified')}")
-            
-            if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
-                st.success(f"**GPU Used:** {st.session_state.gpu_info['name']} ({st.session_state.gpu_info['vram_gb']:.1f}GB VRAM)")
-                st.info(f"**Batch Size:** {st.session_state.optimal_batch_size} documents")
-            
-            # Processing summary
-            st.write("---")
-            st.subheader("Processing Summary")
-            
-            summary_text = f"""
-            ## Processing Summary
-            
-            **Total Execution:** {total_files} files processed
-            **Success Rate:** {(successful/total_files*100 if total_files>0 else 0):.1f}%
-            **Total Data:** {total_size_mb:.1f} MB
-            **Analysis Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-            
-            **Configuration:**
-            - LLM: {config.get('model', 'N/A')}
-            - Embeddings: {config.get('embedding_model', 'N/A')}
-            - Ollama: http://{config.get('ollama_host', 'N/A')}:{config.get('ollama_port', 'N/A')}
-            
-            **Performance:**
-            - Average file size: {avg_size_mb:.1f} MB
-            - Total rows processed: {total_rows:,}
-            - Total chunks created: {total_chunks_created:,}
-            - Total chunks processed: {total_chunks_processed:,}
-            - Batch processing: ENABLED (no truncation)
-            """
-            
-            st.markdown(summary_text)
-            
-            # Download statistics report
-            stats_report = f"""FORENSIQ PROCESSING STATISTICS REPORT
-Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                        
+                        for item in timeline_data:
+                            status_color = {
+                                'success': '#28a745',
+                                'skipped': '#ffc107',
+                                'error': '#dc3545'
+                            }.get(item['status'], '#6c757d')
+                            
+                            time_str = item['timestamp'].strftime("%H:%M:%S")
+                            timeline_html += f"""
+                            <div style="display: flex; align-items: center; margin: 10px 0; padding: 10px; background: white; border-radius: 5px; border-left: 5px solid {status_color};">
+                                <div style="flex: 0 0 80px; font-weight: bold;">{time_str}</div>
+                                <div style="flex: 1;">{item['file']}</div>
+                                <div style="flex: 0 0 60px; text-align: right; font-weight: bold; color: {status_color};">{item['status'].upper()}</div>
+                                <div style="flex: 0 0 80px; text-align: right;">{item['size_mb']:.1f} MB</div>
+                            </div>
+                            """
+                        
+                        timeline_html += "</div>"
+                        st.markdown(timeline_html, unsafe_allow_html=True)
+                
+                # Model information
+                st.write("---")
+                st.subheader("Model Information")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.info(f"**LLM Model:** {config.get('model', 'Not specified')}")
+                with col2:
+                    st.info(f"**Embedding Model:** {config.get('embedding_model', 'Not specified')}")
+                
+                if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+                    st.success(f"**GPU Used:** {st.session_state.gpu_info['name']} ({st.session_state.gpu_info['vram_gb']:.1f}GB VRAM)")
+                    st.info(f"**Batch Size:** {st.session_state.optimal_batch_size} documents")
+                
+                # Processing summary
+                st.write("---")
+                st.subheader("Processing Summary")
+                
+                summary_text = f"""
+                ## Processing Summary
+                
+                **Total Execution:** {total_files} files processed
+                **Success Rate:** {(successful/total_files*100 if total_files>0 else 0):.1f}%
+                **Total Data:** {total_size_mb:.1f} MB
+                **Analysis Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                
+                **Configuration:**
+                - LLM: {config.get('model', 'N/A')}
+                - Embeddings: {config.get('embedding_model', 'N/A')}
+                - Ollama: http://{config.get('ollama_host', 'N/A')}:{config.get('ollama_port', 'N/A')}
+                
+                **Performance:**
+                - Average file size: {avg_size_mb:.1f} MB
+                - Total rows processed: {total_rows:,}
+                - Total chunks created: {total_chunks_created:,}
+                - Total chunks processed: {total_chunks_processed:,}
+                - Batch processing: ENABLED (no truncation)
+                """
+                
+                st.markdown(summary_text)
+                
+                # Download statistics report
+                stats_report = f"""FORENSIQ PROCESSING STATISTICS REPORT
+    Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-SUMMARY
-=======
-Total Files Processed: {total_files}
-Successful Analyses: {successful} ({(successful/total_files*100 if total_files>0 else 0):.1f}%)
-Skipped Files: {skipped}
-Errors: {errors}
+    SUMMARY
+    =======
+    Total Files Processed: {total_files}
+    Successful Analyses: {successful} ({(successful/total_files*100 if total_files>0 else 0):.1f}%)
+    Skipped Files: {skipped}
+    Errors: {errors}
 
-Total Data Size: {total_size_mb:.1f} MB
-Average File Size: {avg_size_mb:.1f} MB
-Total Rows Processed: {total_rows:,}
-Total Chunks Created: {total_chunks_created:,}
-Total Chunks Processed: {total_chunks_processed:,}
+    Total Data Size: {total_size_mb:.1f} MB
+    Average File Size: {avg_size_mb:.1f} MB
+    Total Rows Processed: {total_rows:,}
+    Total Chunks Created: {total_chunks_created:,}
+    Total Chunks Processed: {total_chunks_processed:,}
 
-CONFIGURATION
-=============
-LLM Model: {config.get('model', 'N/A')}
-Embedding Model: {config.get('embedding_model', 'N/A')}
-Ollama URL: http://{config.get('ollama_host', 'N/A')}:{config.get('ollama_port', 'N/A')}
+    CONFIGURATION
+    =============
+    LLM Model: {config.get('model', 'N/A')}
+    Embedding Model: {config.get('embedding_model', 'N/A')}
+    Ollama URL: http://{config.get('ollama_host', 'N/A')}:{config.get('ollama_port', 'N/A')}
 
-BATCH PROCESSING
-================
-Batch Size: {st.session_state.batch_settings['documents_per_batch']} documents
-Max Retrieved: {st.session_state.batch_settings['max_retrieved_docs']} documents
-Truncation: DISABLED (all data processed)
+    BATCH PROCESSING
+    ================
+    Batch Size: {st.session_state.batch_settings['documents_per_batch']} documents
+    Max Retrieved: {st.session_state.batch_settings['max_retrieved_docs']} documents
+    Truncation: DISABLED (all data processed)
 
-GPU INFORMATION
-===============
-"""
-            
-            if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
-                stats_report += f"""GPU: {st.session_state.gpu_info['name']}
-VRAM: {st.session_state.gpu_info['vram_gb']:.1f} GB
-Optimal Batch Size: {st.session_state.optimal_batch_size} documents
-"""
-            else:
-                stats_report += "GPU: Not available (CPU mode)\n"
-            
-            stats_report += f"""
-DETAILED FILE RESULTS
-=====================
-"""
-            
-            for i, file_result in enumerate(st.session_state.processed_files):
+    GPU INFORMATION
+    ===============
+    """
+                
+                if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
+                    stats_report += f"""GPU: {st.session_state.gpu_info['name']}
+    VRAM: {st.session_state.gpu_info['vram_gb']:.1f} GB
+    Optimal Batch Size: {st.session_state.optimal_batch_size} documents
+    """
+                else:
+                    stats_report += "GPU: Not available (CPU mode)\n"
+                
                 stats_report += f"""
-File {i+1}: {file_result.get('path', 'N/A')}
-  Status: {file_result.get('status', 'unknown')}
-  Size: {file_result.get('size', 0) / (1024 * 1024):.1f} MB
-  Rows: {file_result.get('rows_ingested', 'N/A')}
-  Chunks Created: {file_result.get('chunks_created', 'N/A')}
-  Chunks Processed: {file_result.get('chunks_processed', 'N/A')}
-  Timestamp: {file_result.get('analysis_timestamp', 'N/A')}
-"""
-            
-            st.download_button(
-                label="📊 Download Statistics Report",
-                data=stats_report,
-                file_name=f"dfir_statistics_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain",
-                key="download_statistics"
-            )
+    DETAILED FILE RESULTS
+    =====================
+    """
+                
+                for i, file_result in enumerate(st.session_state.processed_files):
+                    stats_report += f"""
+    File {i+1}: {file_result.get('path', 'N/A')}
+      Status: {file_result.get('status', 'unknown')}
+      Size: {file_result.get('size', 0) / (1024 * 1024):.1f} MB
+      Rows: {file_result.get('rows_ingested', 'N/A')}
+      Chunks Created: {file_result.get('chunks_created', 'N/A')}
+      Chunks Processed: {file_result.get('chunks_processed', 'N/A')}
+      Timestamp: {file_result.get('analysis_timestamp', 'N/A')}
+    """
+                
+                st.download_button(
+                    label="📊 Download Statistics Report",
+                    data=stats_report,
+                    file_name=f"dfir_statistics_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain",
+                    key="download_statistics"
+                )
     # --- END UPDATED REPORT DISPLAY LOGIC ---
 
     # Footer
