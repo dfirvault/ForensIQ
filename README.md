@@ -44,7 +44,14 @@ python streamlit run Forensiq.py
 or launch the batch script:
 https://github.com/dfirvault/ForensIQ/blob/main/ForensIQLauncher.bat
 
+![explorer_e4PD1Xq5rU](https://github.com/user-attachments/assets/7802c6d0-2def-4dd5-9e88-9e08ed7d134a)
+
 ---
+
+4. Upload a log using the Web UI and start analysis!
+
+![chrome_ue7DnzjCON](https://github.com/user-attachments/assets/f7c417fa-3311-4880-b342-432777ad77d1)
+
 
 ## ⚡ Usage
 
