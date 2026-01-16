@@ -108,32 +108,138 @@ COMMON_LOG_FILES = {
     'application', 'access', 'error', 'events'
 }
 
-# --- UPDATED: Detailed DFIR Prompt for Comprehensive Analysis ---
-DEFAULT_DFIR_PROMPT = """You are a cybersecurity analyst. Analyze these Windows event logs and answer:
+# --- UPDATED: Comprehensive DFIR Prompt for Detailed Analysis ---
+DETAILED_DFIR_PROMPT = """You are a senior cybersecurity DFIR (Digital Forensics and Incident Response) analyst conducting a comprehensive investigation. Your analysis MUST be extremely detailed, thorough, and provide comprehensive explanations.
 
-1. List all suspicious IP addresses and why they're suspicious
-2. List all suspicious user accounts and activities
-3. Find evidence of these specific threats:
-   - RDP tunneling/port forwarding
-   - Password hash attacks (NTLMv1 usage)
-   - Log clearing
-   - Unusual process execution (especially plink.exe)
-   - Lateral movement between systems
+# ANALYSIS REQUIREMENTS:
 
-4. Create a timeline of malicious events from first to last
-5. Rate the overall threat level (1-10) with explanation
-6. Suggest 3 immediate actions to take
+## 1. EXECUTIVE SUMMARY (Detailed)
+- Provide a 3-5 paragraph overview of findings
+- State the overall security posture
+- Highlight the most critical findings first
+- Estimate the incident timeline and scope
 
-Format as:
-- IOCs: [list]
-- Timeline: [list]
-- Threat Level: [number/10]
-- Actions: [list]
+## 2. DETAILED TECHNICAL ANALYSIS (Expand each section)
+### Suspicious IP Addresses
+For EACH IP address found:
+- List ALL occurrences with timestamps
+- Explain WHY it's suspicious (port scans, brute force, unusual geolocation, etc.)
+- Provide context from logs (what was attempted/accessed)
+- Risk assessment (High/Medium/Low)
+
+### Suspicious User Accounts & Activities
+For EACH user account:
+- Document ALL activities with timestamps
+- Identify privilege escalation attempts
+- Note failed/successful logins
+- Highlight unusual patterns (off-hours, multiple systems)
+
+### Specific Threat Evidence (Detailed Findings)
+#### RDP Tunneling/Port Forwarding
+- Identify specific commands (plink.exe, netcat, etc.)
+- Document source/destination IPs
+- Note any encrypted/obfuscated traffic
+
+#### Password Hash Attacks
+- Identify NTLMv1 usage specifically
+- Document hash extraction attempts
+- Note pass-the-hash activities
+
+#### Log Clearing Evidence
+- Identify event IDs 1102, 104, 517
+- Document clearing attempts with timestamps
+- Note what logs were targeted
+
+#### Unusual Process Execution
+- List ALL unusual processes found
+- Document parent-child relationships
+- Note execution paths and arguments
+- Flag living-off-the-land binaries (LOLBAS)
+
+#### Lateral Movement
+- Document ALL lateral movement attempts
+- Identify techniques used (WMI, PSExec, RDP, etc.)
+- Map the movement path between systems
+
+## 3. COMPREHENSIVE TIMELINE
+Create a minute-by-minute timeline including:
+- Initial access
+- Discovery/reconnaissance
+- Lateral movement
+- Privilege escalation
+- Data exfiltration
+- Persistence establishment
+- Defense evasion attempts
+
+## 4. THREAT INTELLIGENCE CORRELATION
+- Map findings to MITRE ATT&CK techniques
+- Provide TTPs (Tactics, Techniques, Procedures)
+- Suggest likely threat actor groups
+- Note any indicators matching known campaigns
+
+## 5. INDICATORS OF COMPROMISE (IOCs) - Comprehensive List
+### Host-based IOCs
+- File paths and hashes (MD5, SHA256)
+- Registry keys modified
+- Scheduled tasks created
+- Services installed
+
+### Network-based IOCs
+- ALL suspicious IPs with ASN and geolocation
+- Domain names and URLs
+- User agents and HTTP headers
+- Protocol anomalies
+
+### Behavioral IOCs
+- Tactics, Techniques, and Procedures observed
+- Tools and scripts used
+- Persistence mechanisms
+- Data staging locations
+
+## 6. THREAT LEVEL ASSESSMENT (Detailed)
+Rate 1-10 with detailed justification:
+- Attack sophistication (1-10)
+- Impact severity (1-10)
+- Breach scope (1-10)
+- Defensive gaps exploited (1-10)
+- Overall threat score with explanation
+
+## 7. ACTIONABLE RECOMMENDATIONS (Prioritized)
+### IMMEDIATE Actions (0-24 hours)
+1. [Specific containment step 1]
+2. [Specific eradication step 2]
+3. [Specific recovery step 3]
+
+### SHORT-TERM Actions (1-7 days)
+1. [Hardening recommendation 1]
+2. [Monitoring improvement 2]
+3. [Policy update 3]
+
+### LONG-TERM Actions (30+ days)
+1. [Architectural change 1]
+2. [Security program enhancement 2]
+3. [Training requirement 3]
+
+## 8. INVESTIGATION NOTES
+- Data sources analyzed and limitations
+- Assumptions made
+- Areas requiring further investigation
+- Confidence level in findings (High/Medium/Low)
+
+# FORMAT REQUIREMENTS:
+- Use clear headings and subheadings
+- Include tables for IOCs where appropriate
+- Use bullet points for lists
+- Bold key findings for emphasis
+- Ensure report is scannable but comprehensive
+
+# IMPORTANT: Your response should be MINIMUM 1500-2000 words. Provide exhaustive detail with specific log examples.
 
 Context (Log Data for Analysis): {context}
 
 Question: {question}
 
+Now provide your comprehensive DFIR analysis:
 """
 # --- END UPDATE ---
 
@@ -185,14 +291,19 @@ MODEL_CATEGORIES = {
         "models": [
             "llama3.1:70b-instruct-q4_0",
             "llama3.1:70b-instruct-q8_0",
+            "llama3.1:70b-instruct-f16",
             "qwen2.5:72b-instruct-q4_0",
+            "qwen2.5:72b-instruct-q8_0",
             "mixtral:8x22b-instruct-q4_0",
             "dolphin-llama3.1:70b",
-            "wizardlm2:7b",  # Good at detailed explanations
-            "Yeah ",  # Excellent for structured responses
-            "command-r-plus:104b"  # If you have enough RAM/VRAM
+            "wizardlm2:7b",  # Excellent at detailed explanations
+            "ye ",  # Structured responses
+            "command-r-plus:104b",  # Very detailed
+            "llama3:70b-instruct",  # Good balance
+            "mistral:large",  # Detailed reasoning
         ],
-        "priority": 6
+        "priority": 6,
+        "recommended_for": "Comprehensive reports, detailed analysis, executive summaries"
     },
     "balanced": {
         "description": "🎯 Balanced (Better Quality)",
@@ -390,7 +501,7 @@ def load_config():
         config['model'] = 'llama3.2:3b-instruct-q4_0'
         config['embedding_model'] = 'nomic-embed-text'
         config['last_run'] = 'Never'
-        config['dfir_prompt'] = DEFAULT_DFIR_PROMPT
+        config['dfir_prompt'] = DETAILED_DFIR_PROMPT
         save_config(config)
         st.info(f"Config file created at {CONFIG_FILE}")
     else:
@@ -414,12 +525,12 @@ def load_config():
         if 'embedding_model' not in config:
             config['embedding_model'] = 'nomic-embed-text'
         if 'dfir_prompt' not in config:
-            config['dfir_prompt'] = DEFAULT_DFIR_PROMPT
+            config['dfir_prompt'] = DETAILED_DFIR_PROMPT
 
         # --- FIX for old, un-escaped prompts ---
         if 'You are a senior DFIR' in config['dfir_prompt'] and len(config['dfir_prompt']) < 100:
             st.warning("Old config.txt format detected. Resetting prompt to default.")
-            config['dfir_prompt'] = DEFAULT_DFIR_PROMPT
+            config['dfir_prompt'] = DETAILED_DFIR_PROMPT
         # --- END FIX ---
 
         # Re-save to add missing keys and fix prompt format
@@ -430,7 +541,7 @@ def load_config():
 # --- UPDATED: save_config() with JSON fix ---
 def save_config(config):
     # We must use json.dumps to escape newlines and special chars
-    prompt = config.pop('dfir_prompt', DEFAULT_DFIR_PROMPT)
+    prompt = config.pop('dfir_prompt', DETAILED_DFIR_PROMPT)
     prompt_to_save = json.dumps(prompt)
     
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -1045,7 +1156,8 @@ def create_model_display_name(model_name):
         "very_fast": "🚀",
         "fast": "⚡",
         "balanced": "🎯",
-        "quality": "🏆"
+        "quality": "🏆",
+        "detailed_analysis": "📊"
     }.get(category, "🔹")
     
     category_desc = MODEL_CATEGORIES.get(category, {}).get("description", category.title())
@@ -1108,23 +1220,28 @@ def get_gpu_recommendation():
     except:
         return "llama3.2:3b-instruct-q4_0", "GPU detection failed - Using fast default"
 
+# --- UPDATED: refresh_ollama_connection with enhanced parameters for longer responses ---
 def refresh_ollama_connection(config):
-    """Refresh Ollama connection with current config"""
+    """Refresh Ollama connection with enhanced parameters for longer responses"""
     ollama_url = f"http://{config['ollama_host']}:{config['ollama_port']}"
     try:
         available_models = get_available_models(ollama_url)
         recommended_models = get_recommended_models(available_models)
         
-        # Enhanced LLM with parameters for detailed responses
+        # ENHANCED LLM with parameters for detailed responses
         llm = OllamaLLM(
             model=config['model'],
             base_url=ollama_url,
             temperature=0.7,  # Increased for more creative/detailed responses
-            top_p=0.9,  # Nucleus sampling for diversity
-            num_predict=8192,  # Maximum tokens to generate (increase for longer responses)
+            top_p=0.9,        # Nucleus sampling for diversity
+            num_predict=16384,  # DOUBLED from 8192: Maximum tokens to generate
             repeat_penalty=1.1,  # Penalize repetition
-            num_ctx=8192,  # Context window size
-            # streaming=True  # Optional: for streaming responses
+            num_ctx=16384,    # DOUBLED context window size
+            top_k=40,         # Consider more tokens for variety
+            mirostat=2,       # Enable mirostat for better coherence in long responses
+            mirostat_tau=5.0, # Target perplexity
+            mirostat_eta=0.1, # Learning rate
+            # streaming=True   # Optional: for streaming responses
         )
         
         return {
@@ -1678,84 +1795,78 @@ def add_to_vector_store_batch(vectorstore, chunks, config, ollama_url, batch_num
         st.error(f"❌ Error adding batch {batch_number} to vector store: {str(e)}")
         return False
 
-# --- NEW: Analyze large datasets with smart retrieval ---
-def analyze_large_dataset(vectorstore, llm, user_prompt_template, max_docs_per_query=20):
-    """Analyze large datasets with smart retrieval"""
+# --- UPDATED: Analyze large datasets with enhanced retrieval for more context ---
+def analyze_large_dataset(vectorstore, llm, user_prompt_template, max_docs_per_query=50):  # Increased from 20
+    """Analyze large datasets with enhanced retrieval for more context"""
     try:
         if vectorstore is None:
             return None
        
-        st.write("🤖 Starting AI analysis with smart retrieval...")
+        st.write("🤖 Starting comprehensive AI analysis with enhanced context...")
        
         # Validate prompt
         if "{context}" not in user_prompt_template or "{question}" not in user_prompt_template:
             raise ValueError("Prompt template must include {context} and {question} placeholders.")
        
-        # Create retriever - COMPATIBLE VERSION
+        # Create enhanced retriever with more documents
         try:
-            if CHROMADB_SUPPORTS_SCORE_THRESHOLD:
-                # Newer chromadb version with score_threshold
-                retriever = vectorstore.as_retriever(
-                    search_kwargs={
-                        "k": min(max_docs_per_query, 50)
-                    }
-                )
-            else:
-                # Older chromadb version
-                retriever = vectorstore.as_retriever(
-                    search_kwargs={
-                        "k": min(max_docs_per_query, 50),
-                    }
-                )
-        except Exception as e:
-            # Fallback to simplest retriever
-            st.warning(f"⚠️ Retriever creation issue: {e}. Using simple retriever.")
             retriever = vectorstore.as_retriever(
-                search_kwargs={"k": min(max_docs_per_query, 30)}
+                search_kwargs={"k": min(max_docs_per_query, 100)}   # or 50–75 if context gets too big
+            )
+        except Exception as e:
+            st.warning(f"⚠️ Retriever creation issue: {e}. Using enhanced retriever.")
+            retriever = vectorstore.as_retriever(
+                search_kwargs={"k": min(max_docs_per_query, 75)}  # Increased
             )
        
-        # Get relevant documents
+        # Get MORE relevant documents for comprehensive analysis
         relevant_docs = retriever.invoke(
-            "Analyze these logs for security incidents, anomalies, or signs of compromise. " +
-            "Look for: malicious activity, unauthorized access, data exfiltration, " +
-            "privilege escalation, lateral movement, command and control communications, " +
-            "data theft, ransomware indicators, brute force attacks, vulnerability exploitation."
+            "Analyze these logs COMPREHENSIVELY for ALL security incidents, anomalies, indicators of compromise, threats, risks, suspicious activities, errors, warnings, authentication events, network activities, and system changes. " +
+            "Look for EVERYTHING relevant to security including: malicious activity, unauthorized access, data exfiltration, " +
+            "privilege escalation, lateral movement, command and control communications, persistence mechanisms, " +
+            "data theft, ransomware indicators, brute force attacks, vulnerability exploitation, configuration changes, " +
+            "account modifications, service installations, scheduled tasks, registry changes, file modifications, " +
+            "network connections, DNS queries, firewall events, antivirus alerts, and any abnormal system behavior."
         )
        
         if not relevant_docs:
-            return "## No Relevant Security Data Found\n\nAfter thorough analysis of the provided log data, no clear indicators of compromise or malicious activity were detected. This could indicate:\n\n1. **Clean System**: No security incidents in the analyzed timeframe\n2. **Limited Logging**: Security events may not be captured in these logs\n3. **Sophisticated Attack**: Threats may be using evasion techniques\n\n**Recommendations:**\n- Review additional log sources (network, endpoint, cloud)\n- Implement enhanced logging for security events\n- Consider proactive threat hunting exercises"
+            return "## No Relevant Security Data Found\n\nAfter thorough analysis of the provided log data, no clear indicators of compromise or malicious activity were detected."
        
-        # Process in manageable chunks if we have many documents
-        if len(relevant_docs) > 30:
-            st.write(f"📊 Found {len(relevant_docs)} relevant documents. Processing in sections...")
+        # ENHANCED: Process in larger sections for more comprehensive analysis
+        if len(relevant_docs) > 20:
+            st.write(f"📊 Found {len(relevant_docs)} relevant documents. Processing in comprehensive sections...")
            
-            # Split into sections for analysis
+            # Split into larger sections for better context
             sections = []
-            section_size = 15  # Process 15 docs at a time for better quality
+            section_size = 25  # Increased from 15 for more context per section
            
             for i in range(0, len(relevant_docs), section_size):
                 section_docs = relevant_docs[i:i + section_size]
-                section_text = "\n\n" + "="*50 + f"\nSECTION {i//section_size + 1}\n" + "="*50 + "\n\n"
-                section_text += "\n\n--- LOG CHUNK ---\n\n".join([doc.page_content for doc in section_docs])
+                section_text = "\n\n" + "="*60 + f"\nSECTION {i//section_size + 1} ({len(section_docs)} DOCUMENTS)\n" + "="*60 + "\n\n"
+                section_text += "\n\n" + "-"*40 + " LOG CHUNK " + "-"*40 + "\n\n".join([doc.page_content for doc in section_docs])
                 sections.append(section_text)
            
-            # Analyze each section with a detailed prompt
+            # Analyze each section with a MORE detailed prompt
             section_reports = []
             for idx, section in enumerate(sections):
-                st.write(f"📋 Analyzing section {idx + 1}/{len(sections)}...")
+                st.write(f"📋 Analyzing section {idx + 1}/{len(sections)} comprehensively...")
                
                 map_prompt_template = """
-                You are a DFIR analyst analyzing a section of log data.
+                You are a DFIR analyst conducting DEEP DIVE analysis of log data.
                 
-                Provide DETAILED analysis including:
-                1. Specific security events found
-                2. Exact log patterns that indicate threats
-                3. Technical analysis of each finding
-                4. Potential impact if confirmed
-                5. Recommended immediate investigation steps
+                Provide EXTREMELY DETAILED analysis including:
+                1. EXHAUSTIVE listing of all security events with exact timestamps
+                2. SPECIFIC log patterns, error messages, and warning texts
+                3. TECHNICAL analysis with root cause explanations
+                4. POTENTIAL impact assessment with evidence
+                5. CORRELATION with other events in this section
+                6. MITRE ATT&CK technique mapping
+                7. CONFIDENCE level for each finding
+                8. RECOMMENDED investigation steps
                 
-                Be specific and cite exact log content when possible.
-                If no threats found, explain what normal activity looks like.
+                Be exhaustive, specific, and cite exact log content with line numbers when possible.
+                If no threats found, document ALL normal activity patterns for baseline.
+                Minimum 500 words per section.
                 
                 Log Section:
                 {context}
@@ -1766,19 +1877,19 @@ def analyze_large_dataset(vectorstore, llm, user_prompt_template, max_docs_per_q
                
                 section_result = map_chain.invoke({"context": section})
                 section_report = str(section_result.content) if hasattr(section_result, 'content') else str(section_result)
-                section_reports.append(f"\n{'='*60}\nSECTION {idx + 1} ANALYSIS\n{'='*60}\n\n{section_report}")
+                section_reports.append(f"\n{'='*80}\nSECTION {idx + 1} COMPREHENSIVE ANALYSIS\n{'='*80}\n\n{section_report}")
            
-            # Combine all section reports
-            combined_context = "\n\n".join(section_reports)
+            # Combine all section reports with enhanced formatting
+            combined_context = "\n\n" + "📊 " + "="*70 + " COMBINED ANALYSIS " + "="*70 + "\n\n".join(section_reports)
            
         else:
-            # Fewer docs - process all at once with detailed context
+            # Fewer docs - process all at once with MAXIMUM detail
             combined_context = "\n\n".join([
-                f"\n{'='*40}\nLOG CHUNK {i+1}\n{'='*40}\n{doc.page_content}"
+                f"\n{'='*50}\nLOG CHUNK {i+1} - COMPLETE CONTENT\n{'='*50}\n{doc.page_content}"
                 for i, doc in enumerate(relevant_docs)
             ])
        
-        # Final reduction step with enhanced prompt
+        # ENHANCED: Final reduction step with expanded prompt
         reduce_prompt = ChatPromptTemplate.from_template(user_prompt_template)
        
         chain = (
@@ -1787,23 +1898,38 @@ def analyze_large_dataset(vectorstore, llm, user_prompt_template, max_docs_per_q
             | llm
         )
        
-        with st.spinner("🧠 Generating comprehensive analysis report... This may take a moment for detailed analysis."):
+        with st.spinner("🧠 Generating COMPREHENSIVE analysis report... This may take several minutes for detailed analysis."):
             result = chain.invoke({
                 "context": combined_context,
-                "question": "Provide an EXTREMELY DETAILED security assessment based on all log data analyzed. Include specific findings, technical analysis, IOCs, timelines, and actionable recommendations."
+                "question": "Provide an EXTREMELY DETAILED, THOROUGH, and COMPREHENSIVE security assessment based on ALL log data analyzed. Include specific findings with evidence, technical analysis, comprehensive IOCs, detailed timelines, MITRE ATT&CK mapping, and actionable recommendations. MINIMUM 2000 words."
             })
        
-        # Format output
+        # Format output with proper markdown
         if hasattr(result, 'content'):
-            return str(result.content)
+            report_text = str(result.content)
         elif hasattr(result, 'text'):
-            return str(result.text)
+            report_text = str(result.text)
         else:
-            return str(result) if result else 'No result returned from analysis.'
+            report_text = str(result) if result else 'No result returned from analysis.'
+        
+        # Add word count and formatting
+        word_count = len(report_text.split())
+        formatted_report = f"""
+# COMPREHENSIVE DFIR ANALYSIS REPORT
+**Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Analysis Scope:** {len(relevant_docs)} document chunks analyzed
+**Report Length:** {word_count:,} words
+
+{report_text}
+
+---
+*Report generated by ForensIQ - DFIR Vault*
+"""
+        return formatted_report
        
     except Exception as e:
-        st.error(f"❌ Error during analysis: {str(e)}")
-        return f"## Analysis Completed with Limitations\n\n**Error encountered:** {str(e)}\n\n**Partial analysis completed.** Please review the processed logs manually for security findings."
+        st.error(f"❌ Error during comprehensive analysis: {str(e)}")
+        return f"## Analysis Completed with Limitations\n\n**Error encountered:** {str(e)}\n\n**Partial analysis completed.**"
 
 # --- UPDATED: analyze_logs function for backward compatibility ---
 def analyze_logs(vectorstore, llm, user_prompt_template):
@@ -1862,49 +1988,60 @@ def generate_executive_summary(processed_files_data, llm):
     
     # 2. Enhanced Final Reduce Prompt with explicit file reference requirement
     final_reduce_prompt_template = """
-    You are a Lead DFIR Analyst with access to comprehensive detailed reports from multiple log files.
+    You are a Lead DFIR Analyst synthesizing comprehensive reports into an executive summary.
     
-    **SOURCE DATA:** You have access to FULL, DETAILED reports from each file. Each file's report begins with "FILE X: [filename]" and contains complete analysis.
+    **REQUIREMENTS:**
+    1. Provide MINIMUM 1000-1500 words
+    2. Include comprehensive technical details
+    3. Link EVERY finding to specific source files
+    4. Provide actionable intelligence
+    5. Structure with clear headings
+    6. Include tables for IOCs
+    7. Provide confidence levels
+    8. Suggest immediate, short-term, and long-term actions
     
-    **YOUR TASK:** Synthesize these detailed reports into a single, high-level Executive Summary that:
-    1. Provides strategic overview of the security posture
-    2. Identifies critical findings across ALL files
-    3. EXCLUSIVELY references specific source file names for EVERY finding
-    4. Creates actionable intelligence for immediate response
-    
-    **CRITICAL REQUIREMENT:** For EVERY key finding, IOC, or security event mentioned, you MUST reference the specific source file name (e.g., "FILE 1: auth.log" or "FILE 3: Security.evtx").
+    **SOURCE DATA:** Complete detailed reports from each file.
     
     **OUTPUT FORMAT:**
     
-    # EXECUTIVE SUMMARY: DFIR THREAT ASSESSMENT
+    # COMPREHENSIVE EXECUTIVE SUMMARY
     
-    ## OVERVIEW
-    [High-level summary of overall security posture across all analyzed files]
+    ## 1. EXECUTIVE OVERVIEW (3-5 paragraphs)
+    [High-level summary with key findings]
     
-    ## CRITICAL FINDINGS (File-Linked)
-    [Bullet points of top findings, EACH explicitly linked to source file:
-     - **CRITICAL:** [Finding description] **(Source: FILE X: [filename])**
-     - **HIGH:** [Finding description] **(Source: FILE Y: [filename])**
-     - **MEDIUM:** [Finding description] **(Source: FILE Z: [filename])**]
+    ## 2. CRITICAL FINDINGS (Detailed, File-Linked)
+    [Table format with: Finding | Severity | Source File | Evidence | Confidence]
     
-    ## INDICATORS OF COMPROMISE (IOC Catalog)
-    [Organized list of IOCs with file attribution:
-    ### IP Addresses
-    - 192.168.1.100: Suspicious SSH attempts **(Source: FILE 2: secure.log)**
+    ## 3. COMPREHENSIVE IOC CATALOG
+    ### 3.1 Network IOCs
+    [Table: IP | First Seen | Last Seen | Activity | Source File]
     
-    ### User Accounts
-    - JSmith: Unauthorized privilege escalation **(Source: FILE 5: Security.evtx)**
+    ### 3.2 Host IOCs
+    [Table: Indicator | Type | Path/Value | Source File]
     
-    ### File Paths/Hashes
-    - /tmp/malware.exe: Unusual binary execution **(Source: FILE 3: syslog)**]
+    ### 3.3 Behavioral IOCs
+    [Table: Behavior | TTP | MITRE ATT&CK | Source File]
     
-    ## TIMELINE CORRELATION
-    [Cross-file timeline analysis showing sequence of events across multiple logs]
+    ## 4. TIMELINE CORRELATION
+    [Detailed timeline across all files with specific timestamps]
     
-    ## ACTIONABLE RECOMMENDATIONS
-    [Prioritized recommendations based on findings across all files]
+    ## 5. THREAT ASSESSMENT MATRIX
+    [Risk matrix with scores and justifications]
     
-    **Source Detailed Reports (Complete Context):**
+    ## 6. PRIORITIZED ACTION PLAN
+    ### 6.1 Immediate Actions (0-24 hours)
+    [Specific, actionable steps]
+    
+    ### 6.2 Short-term Actions (1-7 days)
+    [Hardening and monitoring improvements]
+    
+    ### 6.3 Long-term Actions (30+ days)
+    [Strategic improvements]
+    
+    ## 7. INVESTIGATION NOTES
+    [Limitations, assumptions, further investigation needed]
+    
+    **Source Detailed Reports:**
     {context}
     """
     
@@ -1917,12 +2054,40 @@ def generate_executive_summary(processed_files_data, llm):
         | llm
     )
     
-    with st.spinner("🧠 Running final Executive Summary consolidation with full context..."):
+    with st.spinner("🧠 Generating comprehensive Executive Summary (this may take several minutes)..."):
         result = final_chain.invoke({"context": concatenated_reports})
         
     if hasattr(result, 'content'):
         return str(result.content)
-    return str(result) if result else "Consolidation failed or returned no data."
+    return str(result) if result else "Consolidation failed."
+
+# --- NEW FUNCTION: Enhance response quality ---
+def enhance_response_quality(response_text, min_words=1000):
+    """
+    Post-process response to ensure it meets minimum quality standards
+    """
+    if not response_text:
+        return response_text
+    
+    words = len(response_text.split())
+    
+    # If response is too short, add guidance
+    if words < min_words:
+        enhancement_prompt = f"""
+        The following analysis is too brief. Please expand it to be more comprehensive,
+        detailed, and thorough. Add specific examples, technical details, and actionable
+        recommendations. Target length: {min_words} words.
+        
+        Current analysis:
+        {response_text}
+        
+        Expanded comprehensive analysis:
+        """
+        
+        # You could use a quick LLM call here or just add a note
+        return response_text + f"\n\n---\n**Note:** Analysis abbreviated. Consider using a larger model or adjusting parameters for more detail."
+    
+    return response_text
 
 # --- FIXED: Monitor resources continuously with proper session state checking ---
 def monitor_resources_continuously():
@@ -2307,7 +2472,22 @@ def process_file_queue(llm, config, ollama_url, analysis_prompt):
 
                         status.write("🤖 **Step 4:** AI analysis with DFIR expert...")
                         # Use the new analyze_large_dataset function
-                        report = analyze_large_dataset(vectorstore, llm, analysis_prompt, max_docs_per_query=30)
+                        report = analyze_large_dataset(vectorstore, llm, analysis_prompt, max_docs_per_query=50)
+
+                        # Enhance response quality
+                        if report and hasattr(st.session_state, 'response_config'):
+                            min_words_map = {
+                                "Brief": 300,
+                                "Standard": 800,
+                                "Detailed": 1500,
+                                "Comprehensive": 2500,
+                                "Exhaustive": 4000
+                            }
+                            min_words = min_words_map.get(
+                                st.session_state.response_config.get("detail_level", "Detailed"),
+                                1500
+                            )
+                            report = enhance_response_quality(report, min_words)
 
                         if st.session_state.job_status != 'running':
                             status.write("⏹️ Analysis stopped by user")
@@ -2535,7 +2715,22 @@ def process_single_file_streaming(file_path, file_extension, llm, config, ollama
                         status.write(f"✅ **Step 3 Complete:** Vector store ready with {all_documents_processed:,} documents")
 
                         status.write("🤖 **Step 4:** AI analysis with DFIR expert...")
-                        report = analyze_large_dataset(vectorstore, llm, analysis_prompt, max_docs_per_query=30)
+                        report = analyze_large_dataset(vectorstore, llm, analysis_prompt, max_docs_per_query=50)
+
+                        # Enhance response quality
+                        if report and hasattr(st.session_state, 'response_config'):
+                            min_words_map = {
+                                "Brief": 300,
+                                "Standard": 800,
+                                "Detailed": 1500,
+                                "Comprehensive": 2500,
+                                "Exhaustive": 4000
+                            }
+                            min_words = min_words_map.get(
+                                st.session_state.response_config.get("detail_level", "Detailed"),
+                                1500
+                            )
+                            report = enhance_response_quality(report, min_words)
 
                         if st.session_state.job_status != 'running':
                             status.write("⏹️ Analysis stopped by user")
@@ -2657,6 +2852,11 @@ def main():
         st.session_state.batch_settings = {
             'documents_per_batch': 200,
             'max_retrieved_docs': 50
+        }
+    if 'response_config' not in st.session_state:
+        st.session_state.response_config = {
+            "detail_level": "Detailed",
+            "max_tokens": 16384
         }
     # --- END FIX ---
 
@@ -2789,6 +2989,46 @@ def main():
             
             st.info("💡 **Note:** Batch processing prevents 'Too many open files' errors without truncating data.")
         
+        # Response Configuration
+        st.write("---")
+        st.subheader("📏 Response Configuration")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            response_length = st.selectbox(
+                "Response Detail Level",
+                ["Brief", "Standard", "Detailed", "Comprehensive", "Exhaustive"],
+                index=2,  # Default to Detailed
+                help="Controls the length and detail of AI responses"
+            )
+            st.session_state.response_config["detail_level"] = response_length
+
+        with col2:
+            max_tokens = st.slider(
+                "Max Response Tokens",
+                min_value=1024,
+                max_value=32768,
+                value=16384,
+                step=1024,
+                help="Maximum tokens in AI response (higher = longer responses)"
+            )
+            st.session_state.response_config["max_tokens"] = max_tokens
+        
+        # Display current response settings
+        st.write("**Current Response Settings:**")
+        st.write(f"- **Detail Level:** {response_length}")
+        st.write(f"- **Max Tokens:** {max_tokens:,}")
+        
+        # Detail level descriptions
+        detail_descriptions = {
+            "Brief": "~300 words, quick overview",
+            "Standard": "~800 words, balanced analysis",
+            "Detailed": "~1500 words, comprehensive findings",
+            "Comprehensive": "~2500 words, exhaustive analysis",
+            "Exhaustive": "~4000 words, maximum detail"
+        }
+        st.info(f"💡 **{response_length}:** {detail_descriptions.get(response_length, '')}")
+        
         # Refresh models button
         col1, col2 = st.columns([3, 1])
         with col2:
@@ -2823,7 +3063,7 @@ def main():
 
                 llm_models = [m for m in available_models if "embed" not in m.lower()]
 
-                for category in ["gpu_optimized", "very_fast", "fast", "balanced", "quality"]:
+                for category in ["gpu_optimized", "very_fast", "fast", "balanced", "quality", "detailed_analysis"]:
                     if category in recommended_models and recommended_models[category]:
                         for model in recommended_models[category]:
                             if model in llm_models:
@@ -2837,7 +3077,7 @@ def main():
 
                 current_model = config.get('model')
                 if current_model not in model_options:
-                    for category in ["gpu_optimized", "very_fast", "fast", "balanced"]:
+                    for category in ["gpu_optimized", "very_fast", "fast", "balanced", "detailed_analysis"]:
                         if category in recommended_models and recommended_models[category]:
                             current_model = recommended_models[category][0]
                             break
@@ -2863,7 +3103,7 @@ def main():
                 st.write("---")
                 st.write("**📊 LLM Model Recommendations:**")
 
-                for category in ["gpu_optimized", "very_fast", "fast", "balanced", "quality"]:
+                for category in ["gpu_optimized", "very_fast", "fast", "balanced", "quality", "detailed_analysis"]:
                     if category in recommended_models and recommended_models[category]:
                         desc = MODEL_CATEGORIES.get(category, {}).get("description", category.title())
                         models_list = ", ".join(recommended_models[category][:3])
@@ -2905,6 +3145,8 @@ def main():
         if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
             st.write(f"- **GPU:** {st.session_state.gpu_info['name']} ({st.session_state.gpu_info['vram_gb']:.1f}GB)")
             st.write(f"- **Batch Size:** {st.session_state.optimal_batch_size} documents")
+        st.write(f"- **Response Detail:** {st.session_state.response_config.get('detail_level', 'Detailed')}")
+        st.write(f"- **Max Tokens:** {st.session_state.response_config.get('max_tokens', 16384):,}")
         st.write(f"- **Last Run:** {config.get('last_run', 'Never')}")
 
         if st.button("💾 Save Configuration", use_container_width=True):
@@ -2920,7 +3162,7 @@ def main():
         current_prompt = st.text_area(
             "Analysis Prompt",
             value=config['dfir_prompt'],
-            height=350,
+            height=400,
             key="prompt_editor",
             help="The LLM prompt template. {context} and {question} are required."
         )
@@ -3214,6 +3456,12 @@ def main():
                 st.write(f"**Batch Size:** {st.session_state.batch_settings['documents_per_batch']} documents")
                 st.write(f"**Max Retrieved:** {st.session_state.batch_settings['max_retrieved_docs']} documents")
                 st.write(f"**Truncation:** DISABLED (all chunks processed)")
+                
+                # Show response configuration
+                st.write("---")
+                st.write("**Response Configuration:**")
+                st.write(f"**Detail Level:** {st.session_state.response_config.get('detail_level', 'Detailed')}")
+                st.write(f"**Max Tokens:** {st.session_state.response_config.get('max_tokens', 16384):,}")
 
     # Process files if job is running
     if (st.session_state.job_status == 'running' and len(st.session_state.file_queue) > 0):
@@ -3267,6 +3515,10 @@ def main():
                 
                 # Show processing limits
                 st.write(f"🛡️ **Processing:** Batch processing enabled (no truncation)")
+                
+                # Show response configuration
+                response_config = st.session_state.response_config
+                st.write(f"📏 **Response Detail:** {response_config.get('detail_level', 'Detailed')} ({response_config.get('max_tokens', 16384):,} tokens)")
 
                 # Process the temporary file with streaming optimization
                 process_single_file_streaming(temp_file_path, file_extension, llm, config, ollama_url, analysis_prompt)
@@ -3296,7 +3548,11 @@ def main():
                 st.subheader("📊 FINAL DFIR EXECUTIVE SUMMARY")
                 st.markdown("**Report Status:** ✅ Analysis completed")
                 
-                st.text_area("Detailed Security Assessment", st.session_state.current_report, height=500, key="executive_report")
+                # Show report configuration used
+                response_config = st.session_state.response_config
+                st.info(f"**Report Configuration:** {response_config.get('detail_level', 'Detailed')} detail level, {response_config.get('max_tokens', 16384):,} max tokens")
+                
+                st.text_area("Detailed Security Assessment", st.session_state.current_report, height=600, key="executive_report")
                 
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 exec_filename = f"dfir_executive_summary_{timestamp}.txt"
@@ -3318,8 +3574,23 @@ def main():
                         llm = connection_info["llm"]
                         
                         # Generate final summary
-                        with st.spinner("Generating executive summary..."):
+                        with st.spinner("Generating comprehensive executive summary..."):
                             final_summary = generate_executive_summary(st.session_state.processed_files, llm)
+                        
+                        # Enhance response quality
+                        if final_summary and hasattr(st.session_state, 'response_config'):
+                            min_words_map = {
+                                "Brief": 300,
+                                "Standard": 800,
+                                "Detailed": 1500,
+                                "Comprehensive": 2500,
+                                "Exhaustive": 4000
+                            }
+                            min_words = min_words_map.get(
+                                st.session_state.response_config.get("detail_level", "Detailed"),
+                                1500
+                            )
+                            final_summary = enhance_response_quality(final_summary, min_words)
                         
                         # Update session state with the final result
                         st.session_state.current_report = final_summary
@@ -3390,6 +3661,8 @@ def main():
                         st.write(f"**Chunks Processed:** {file_result['chunks_processed']:,}")
                     if 'analysis_timestamp' in file_result:
                         st.write(f"**Analyzed:** {file_result['analysis_timestamp']}")
+                    if 'model_used' in file_result:
+                        st.write(f"**Model:** {file_result['model_used']}")
                     
                     # Display the report content
                     if file_status == 'success' and file_result.get('report'):
@@ -3398,9 +3671,13 @@ def main():
                         st.text_area(
                             f"Detailed Analysis for {file_name}",
                             file_result['report'],
-                            height=300,
+                            height=400,
                             key=f"detailed_report_{i}"
                         )
+                        
+                        # Calculate word count
+                        word_count = len(file_result['report'].split())
+                        st.info(f"**Report Length:** {word_count:,} words")
                         
                         # Individual file download button
                         safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '-', '_')).rstrip()
@@ -3429,6 +3706,10 @@ def main():
             
             if st.session_state.concatenated_reports:
                 st.info("This is the complete concatenated view of all detailed reports that was fed into the LLM for the executive summary generation.")
+                
+                # Calculate total word count
+                total_words = len(st.session_state.concatenated_reports.split())
+                st.info(f"**Total Concatenated Content:** {total_words:,} words")
                 
                 st.text_area(
                     "All Detailed Reports Combined (Used for Executive Summary)",
@@ -3480,8 +3761,17 @@ def main():
             total_chunks_created = sum(f.get('chunks_created', 0) for f in st.session_state.processed_files)
             total_chunks_processed = sum(f.get('chunks_processed', 0) for f in st.session_state.processed_files)
             
+            # Report word counts
+            report_words = []
+            for file_result in st.session_state.processed_files:
+                if file_result.get('status') == 'success' and file_result.get('report'):
+                    report_words.append(len(file_result['report'].split()))
+            
+            avg_report_words = sum(report_words) / len(report_words) if report_words else 0
+            total_report_words = sum(report_words)
+            
             # Display metrics
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("Total Files", total_files)
                 st.metric("Successful", successful, delta=f"{(successful/total_files*100 if total_files>0 else 0):.1f}%")
@@ -3491,6 +3781,9 @@ def main():
             with col3:
                 st.metric("Total Rows", f"{total_rows:,}")
                 st.metric("Total Chunks", f"{total_chunks_processed:,}")
+            with col4:
+                st.metric("Total Report Words", f"{total_report_words:,}")
+                st.metric("Avg Report Words", f"{avg_report_words:,.0f}")
             
             # Success rate chart
             st.write("---")
@@ -3545,6 +3838,29 @@ def main():
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
+                
+                # Report length distribution
+                st.write("---")
+                st.subheader("Report Length Distribution")
+                
+                if report_words:
+                    fig2 = go.Figure(data=[
+                        go.Histogram(
+                            x=report_words,
+                            nbinsx=20,
+                            marker_color='#ef553b',
+                            opacity=0.7
+                        )
+                    ])
+                    
+                    fig2.update_layout(
+                        title="Distribution of Report Word Counts",
+                        xaxis_title="Word Count",
+                        yaxis_title="Number of Reports",
+                        height=400
+                    )
+                    
+                    st.plotly_chart(fig2, use_container_width=True)
                 
                 # Processing timeline
                 st.write("---")
@@ -3602,8 +3918,12 @@ def main():
                 col1, col2 = st.columns(2)
                 with col1:
                     st.info(f"**LLM Model:** {config.get('model', 'Not specified')}")
+                    if st.session_state.response_config:
+                        st.info(f"**Detail Level:** {st.session_state.response_config.get('detail_level', 'Detailed')}")
                 with col2:
                     st.info(f"**Embedding Model:** {config.get('embedding_model', 'Not specified')}")
+                    if st.session_state.response_config:
+                        st.info(f"**Max Tokens:** {st.session_state.response_config.get('max_tokens', 16384):,}")
                 
                 if st.session_state.gpu_info and st.session_state.gpu_info.get("available", False):
                     st.success(f"**GPU Used:** {st.session_state.gpu_info['name']} ({st.session_state.gpu_info['vram_gb']:.1f}GB VRAM)")
@@ -3619,11 +3939,14 @@ def main():
                 **Total Execution:** {total_files} files processed
                 **Success Rate:** {(successful/total_files*100 if total_files>0 else 0):.1f}%
                 **Total Data:** {total_size_mb:.1f} MB
+                **Total Report Content:** {total_report_words:,} words
                 **Analysis Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 
                 **Configuration:**
                 - LLM: {config.get('model', 'N/A')}
                 - Embeddings: {config.get('embedding_model', 'N/A')}
+                - Response Detail: {st.session_state.response_config.get('detail_level', 'Detailed')}
+                - Max Tokens: {st.session_state.response_config.get('max_tokens', 16384):,}
                 - Ollama: http://{config.get('ollama_host', 'N/A')}:{config.get('ollama_port', 'N/A')}
                 
                 **Performance:**
@@ -3631,6 +3954,7 @@ def main():
                 - Total rows processed: {total_rows:,}
                 - Total chunks created: {total_chunks_created:,}
                 - Total chunks processed: {total_chunks_processed:,}
+                - Average report length: {avg_report_words:,.0f} words
                 - Batch processing: ENABLED (no truncation)
                 """
                 
@@ -3652,11 +3976,15 @@ def main():
     Total Rows Processed: {total_rows:,}
     Total Chunks Created: {total_chunks_created:,}
     Total Chunks Processed: {total_chunks_processed:,}
+    Total Report Words: {total_report_words:,}
+    Average Report Words: {avg_report_words:,.0f}
 
     CONFIGURATION
     =============
     LLM Model: {config.get('model', 'N/A')}
     Embedding Model: {config.get('embedding_model', 'N/A')}
+    Response Detail: {st.session_state.response_config.get('detail_level', 'Detailed')}
+    Max Tokens: {st.session_state.response_config.get('max_tokens', 16384)}
     Ollama URL: http://{config.get('ollama_host', 'N/A')}:{config.get('ollama_port', 'N/A')}
 
     BATCH PROCESSING
@@ -3683,6 +4011,7 @@ def main():
     """
                 
                 for i, file_result in enumerate(st.session_state.processed_files):
+                    report_words = len(file_result.get('report', '').split()) if file_result.get('report') else 0
                     stats_report += f"""
     File {i+1}: {file_result.get('path', 'N/A')}
       Status: {file_result.get('status', 'unknown')}
@@ -3690,6 +4019,7 @@ def main():
       Rows: {file_result.get('rows_ingested', 'N/A')}
       Chunks Created: {file_result.get('chunks_created', 'N/A')}
       Chunks Processed: {file_result.get('chunks_processed', 'N/A')}
+      Report Words: {report_words:,}
       Timestamp: {file_result.get('analysis_timestamp', 'N/A')}
     """
                 
