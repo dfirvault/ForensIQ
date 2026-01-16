@@ -32,8 +32,6 @@ cd ForensIQ
 ```bash
 pip install --upgrade langchain langchain-community langchain-ollama langchain-huggingface sentence-transformers chromadb pandas streamlit python-evtx
 ```
-or launch the batch script:
-https://github.com/dfirvault/ForensIQ/blob/main/ForensIQLauncher.bat
 
 3. Run the tool:
 
