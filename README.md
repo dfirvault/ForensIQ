@@ -36,18 +36,19 @@ pip install --upgrade langchain langchain-community langchain-ollama langchain-h
 3. Adjust your model - first run only
 
 Run the following once on your system using a standard cmd.exe prompt:
-
-- setx OLLAMA_MAX_CONTEXT 16384
-- setx OLLAMA_MAX_TOKENS 4096
-- setx OLLAMA_NUM_GPU_LAYERS 28
-
+```bash
+setx OLLAMA_MAX_CONTEXT 16384
+setx OLLAMA_MAX_TOKENS 4096
+setx OLLAMA_NUM_GPU_LAYERS 28
+```
 Next, download the ModelFile that i have uploaded in Github.
-
-- https://github.com/dfirvault/ForensIQ/blob/main/ModelFile
-
+```bash
+https://github.com/dfirvault/ForensIQ/blob/main/ModelFile
+```
 Then run the following command from the same directory as the ModelFile:
-
-- ollama create qwen-long -f Modelfile
+```bash
+ollama create qwen-long -f Modelfile
+```
 
 Now select qwen-long as the LLM model.
 
